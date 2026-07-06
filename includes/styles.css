@@ -1,0 +1,11 @@
+body { font-family: Arial, sans-serif; margin:0; background:#f8fafc; color:#1e293b; }
+.topbar { background:#ffffff; color:#1e293b; padding:15px; border-bottom:1px solid #e2e8f0; box-shadow:0 2px 4px rgba(0,0,0,0.05); }
+.topbar nav a { color:#475569; margin-right:15px; text-decoration:none; font-weight:600; transition:color 0.3s; }
+.topbar nav a:hover { color:#3b82f6; }
+.container { padding:20px; }
+.card { background:#ffffff; padding:15px; margin-bottom:15px; border-radius:8px; box-shadow:0 2px 8px rgba(0,0,0,0.08); border:1px solid #e2e8f0; }
+table { width:100%; border-collapse:collapse; margin-top:10px; background:#fff; }
+th, td { padding:10px; border:1px solid #e2e8f0; text-align:left; }
+th { background:#f8fafc; color:#374151; font-weight:600; }
+button { padding:8px 16px; border:none; border-radius:6px; background:#3b82f6; color:#fff; cursor:pointer; font-weight:600; transition:all 0.3s; }
+button:hover { background:#2563eb; transform:translateY(-1px); box-shadow:0 4px 12px rgba(59,130,246,0.3); }

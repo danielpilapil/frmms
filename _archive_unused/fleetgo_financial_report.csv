@@ -1,0 +1,15 @@
+Report: FleetGo Financial Reports
+
+🚗 Rentals Summary
+ID,Vehicle,Plate,Start,End,Amount,Status
+46,Toyota Fortuner 2.8 G,OTP 2900,2025-10-13,2025-10-13,₱4,500.00,ongoing
+45,Toyota Fortuner 2.8 G,OTP 2900,2025-10-13,2025-10-13,₱4,500.00,completed
+44,Toyota Fortuner 2.8 G,OTP 2900,2025-10-15,2025-10-16,₱9,000.00,cancelled
+43,Toyota Fortuner 2.8 G,OTP 2900,2025-10-14,2025-10-15,₱9,000.00,cancelled
+42,Toyota Fortuner 2.8 G,OTP 2900,2025-10-13,2025-10-14,₱9,000.00,cancelled
+41,Toyota Fortuner 2.8 G,OTP 2900,2025-10-12,2025-10-15,₱18,000.00,completed
+40,Honda City 1.5 RS,MTC-3329,2025-10-12,2025-10-13,₱2,500.00,completed
+
+🛠️ Maintenance Summary
+ID,Vehicle,Plate,Type,Date,Cost,Status
+15,Honda City 1.5 RS,MTC-3329,Preventive,2025-10-12,₱1,000.00,in_progress

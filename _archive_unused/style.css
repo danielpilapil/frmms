@@ -1,0 +1,256 @@
+/* ===== FleetGo Admin Layout (Global) ===== */
+
+body.fg-body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text-primary);
+  font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+.fg-layout {
+  display: flex;
+  min-height: 100vh;
+}
+
+.fg-sidebar {
+  width: 220px;
+  background: #05070a;
+  border-right: 1px solid var(--border);
+  padding: 16px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  position: sticky;
+  top: 0;
+  align-self: flex-start;
+}
+
+.fg-sidebar__brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+
+.fg-sidebar__logo {
+  font-size: 1.4rem;
+}
+
+.fg-sidebar__title {
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  font-size: 0.95rem;
+}
+
+.fg-sidebar__nav {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.fg-sidebar-link {
+  display: block;
+  padding: 8px 10px;
+  border-radius: 8px;
+  color: var(--text-secondary);
+  text-decoration: none;
+  font-size: 0.9rem;
+  font-weight: 500;
+  transition: background 0.2s ease, color 0.2s ease, transform 0.15s ease;
+}
+
+.fg-sidebar-link:hover {
+  background: rgba(93,208,255,0.08);
+  color: var(--text-primary);
+  transform: translateX(2px);
+}
+
+.fg-sidebar-link--active {
+  background: linear-gradient(135deg, rgba(93,208,255,0.15), rgba(124,255,199,0.15));
+  color: var(--text-primary);
+  border: 1px solid rgba(93,208,255,0.5);
+}
+
+.fg-sidebar-link--danger {
+  color: #fecaca;
+}
+
+.fg-sidebar__footer {
+  margin-top: auto;
+  padding-top: 8px;
+  border-top: 1px solid rgba(255,255,255,0.06);
+}
+
+.fg-main {
+  flex: 1;
+  padding: 24px 24px 32px;
+}
+
+.fg-main-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 20px;
+  gap: 12px;
+}
+
+.fg-main-title {
+  font-size: 1.8rem;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.fg-main-subtitle {
+  font-size: 0.9rem;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}
+
+.fg-main-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.fg-btn {
+  border-radius: 999px;
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--text-primary);
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  text-decoration: none;
+  transition: all 0.2s ease;
+}
+
+.fg-btn:hover {
+  background: var(--card-hover);
+  transform: translateY(-1px);
+  box-shadow: var(--shadow);
+}
+
+.fg-btn--primary {
+  background: var(--gradient);
+  color: #04121b;
+  border-color: transparent;
+}
+
+.fg-btn--danger {
+  background: rgba(239,68,68,0.15);
+  color: #fecaca;
+  border-color: rgba(239,68,68,0.4);
+}
+
+/* Content cards and tables */
+.fg-section {
+  margin-top: 24px;
+}
+
+.fg-section h2 {
+  font-size: 1.3rem;
+  font-weight: 700;
+  margin: 0 0 8px;
+}
+
+.fg-section p.fg-section-sub {
+  margin: 0 0 12px;
+  font-size: 0.9rem;
+  color: var(--text-secondary);
+}
+
+.fg-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 8px;
+  background: var(--card);
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+
+.fg-table th,
+.fg-table td {
+  padding: 10px 12px;
+  font-size: 0.85rem;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+}
+
+.fg-table th {
+  text-align: left;
+  background: #101419;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 600;
+}
+
+.fg-table tr:nth-child(even) td {
+  background: rgba(15,21,27,0.85);
+}
+
+.fg-table tr:hover td {
+  background: rgba(93,208,255,0.04);
+}
+
+.fg-badge {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.fg-badge--ok {
+  background: rgba(16,185,129,0.15);
+  color: #6ee7b7;
+  border: 1px solid rgba(16,185,129,0.4);
+}
+
+.fg-badge--warn {
+  background: rgba(245,158,11,0.15);
+  color: #facc15;
+  border: 1px solid rgba(245,158,11,0.4);
+}
+
+.fg-badge--bad {
+  background: rgba(239,68,68,0.15);
+  color: #fecaca;
+  border: 1px solid rgba(239,68,68,0.5);
+}
+
+/* Responsive layout */
+@media (max-width: 900px) {
+  .fg-layout {
+    flex-direction: column;
+  }
+
+  .fg-sidebar {
+    width: 100%;
+    position: static;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .fg-sidebar__nav {
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+
+  .fg-main {
+    padding: 16px;
+  }
+}
+

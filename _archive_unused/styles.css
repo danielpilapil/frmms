@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Fleet Rental Maintenance & Monitoring System</title>
+  <style>
+    /* Reset */
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+      font-family: Arial, sans-serif;
+    }
+
+    body {
+      background: linear-gradient(135deg, #f8fafc, #e2e8f0);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 20px;
+      color: #1e293b;
+    }
+
+    header {
+      width: 100%;
+      max-width: 1000px;
+      background: #ffffff;
+      padding: 15px 25px;
+      border-radius: 10px;
+      margin-bottom: 20px;
+      box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border: 1px solid #e2e8f0;
+    }
+
+    header h1 {
+      color: #1e40af;
+      font-size: 20px;
+      font-weight: 700;
+    }
+
+    nav button {
+      border: none;
+      background: none;
+      padding: 10px 15px;
+      cursor: pointer;
+      color: #475569;
+      font-weight: 600;
+      border-radius: 5px;
+      transition: all 0.3s;
+    }
+
+    nav button:hover,
+    nav button.active {
+      background: #3b82f6;
+      color: #ffffff;
+      transform: translateY(-1px);
+    }
+
+    .container {
+      width: 100%;
+      max-width: 1000px;
+    }
+
+    .card {
+      background: #ffffff;
+      border-radius: 10px;
+      padding: 20px;
+      margin-bottom: 20px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+      border: 1px solid #e2e8f0;
+    }
+
+    .card h2 {
+      margin-bottom: 15px;
+      color: #1e293b;
+      font-weight: 700;
+    }
+
+    .kpis {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 15px;
+    }
+
+    .kpi {
+      background: #f8fafc;
+      padding: 15px;
+      border-radius: 8px;
+      text-align: center;
+      border: 1px solid #e2e8f0;
+    }
+
+    .kpi h3 {
+      font-size: 14px;
+      color: #64748b;
+      font-weight: 600;
+    }
+
+    .kpi p {
+      font-size: 20px;
+      font-weight: bold;
+      color: #1e40af;
+      margin-top: 5px;
+    }
+
+    button.primary {
+      width: 100%;
+      padding: 12px;
+      border: none;
+      border-radius: 5px;
+      background: #3b82f6;
+      color: #ffffff;
+      font-size: 16px;
+      cursor: pointer;
+      transition: all 0.3s;
+      margin-top: 10px;
+      font-weight: 600;
+    }
+
+    button.primary:hover {
+      background: #2563eb;
+      transform: translateY(-1px);
+      box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
+    }
+
+    button.success {
+      background: #10b981;
+    }
+    button.success:hover {
+      background: #059669;
+      transform: translateY(-1px);
+      box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);
+    }
+
+    footer {
+      color: #64748b;
+      margin-top: auto;
+      text-align: center;
+      padding: 10px;
+      font-weight: 500;
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <h1>Fleet Rental Maintenance & Monitoring</h1>
+    <nav>
+      <button class="active">Dashboard</button>
+      <button>Vehicles</button>
+      <button>Rentals</button>
+      <button>Maintenance</button>
+      <button>Reports</button>
+    </nav>
+  </header>
+
+  <div class="container">
+    <div class="card">
+      <h2>Overview</h2>
+      <div class="kpis">
+        <div class="kpi"><h3>Total Vehicles</h3><p>86</p></div>
+        <div class="kpi"><h3>Active Rentals</h3><p>23</p></div>
+        <div class="kpi"><h3>Maintenance Due</h3><p>7</p></div>
+        <div class="kpi"><h3>Alerts</h3><p>3</p></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Quick Actions</h2>
+      <button class="primary">Add New Vehicle</button>
+      <button class="primary">New Rental</button>
+      <button class="primary success">Schedule Maintenance</button>
+    </div>
+  </div>
+
+  <footer>
+    <p>© 2025 Fleet Rental Maintenance & Monitoring System</p>
+  </footer>
+
+</body>
+</html>
