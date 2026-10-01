@@ -2,7 +2,7 @@
 /* =========================================================
    rentals_all.php — FleetGo Admin Panel (Focused Rentals)
    - Clean UI (dark + glass + gradient KPIs)
-   - Status flow: pending → reserved → ongoing → completed/cancelled
+   - Status flow: waitlist → pending → reserved → ongoing → completed/cancelled
    - Auto transition reserved→ongoing when today is in range
    - Safe Extend: cancels overlapping future reservations before changing end_date
    - Notifications still written (for System Logs page), but no bell UI here
@@ -14,6 +14,7 @@ session_name('fleetgo_session_admin');
 session_start();
 
 require_once __DIR__ . '/includes/db.php';
+ensure_rental_waitlist_status($conn);
 
 // Global error suppression for AJAX requests
 if (isset($_POST['ajax_request']) || (isset($_SERVER['HTTP_X_REQUESTED_WITH']) && strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) == 'xmlhttprequest')) {
@@ -330,6 +331,89 @@ function fetchRentals($c){
         LEFT JOIN vw_rental_payment_summary ps ON ps.rental_id = r.id
         ORDER BY r.start_date DESC, r.id DESC";
   return $c->query($sql)->fetch_all(MYSQLI_ASSOC);
+}
+
+function fetchPendingPaymentsByRental($c){
+  $map = [];
+  $sql = "SELECT payment_id, rental_id, amount, payment_method, proof_image,
+                 reference_no, notes, paid_at, payment_type, status
+          FROM rental_payments
+          WHERE status = 'PENDING'
+          ORDER BY paid_at DESC, payment_id DESC";
+  $res = $c->query($sql);
+  if ($res) {
+    while ($row = $res->fetch_assoc()) {
+      $rid = (int)$row['rental_id'];
+      if (!isset($map[$rid])) $map[$rid] = [];
+      $map[$rid][] = $row;
+    }
+  }
+  return $map;
+}
+
+/** All customer-uploaded payment receipts (any status) keyed by rental_id */
+function fetchPaymentReceiptsByRental($c){
+  $map = [];
+  try {
+    $sql = "SELECT payment_id, rental_id, amount, payment_method, proof_image,
+                   reference_no, notes, paid_at, payment_type, status
+            FROM rental_payments
+            WHERE proof_image IS NOT NULL AND proof_image <> ''
+            ORDER BY paid_at DESC, payment_id DESC";
+    $res = $c->query($sql);
+    if ($res) {
+      while ($row = $res->fetch_assoc()) {
+        $rid = (int)$row['rental_id'];
+        if (!isset($map[$rid])) $map[$rid] = [];
+        $map[$rid][] = [
+          'payment_id' => (int)$row['payment_id'],
+          'amount' => (float)$row['amount'],
+          'method' => (string)($row['payment_method'] ?? ''),
+          'proof_image' => (string)($row['proof_image'] ?? ''),
+          'reference_no' => (string)($row['reference_no'] ?? ''),
+          'notes' => (string)($row['notes'] ?? ''),
+          'paid_at' => (string)($row['paid_at'] ?? ''),
+          'payment_type' => (string)($row['payment_type'] ?? ''),
+          'status' => (string)($row['status'] ?? ''),
+        ];
+      }
+    }
+  } catch (Throwable $e) {
+    return [];
+  }
+  return $map;
+}
+
+function fetchPendingExtensionsByRental($c){
+  $c->query("
+    CREATE TABLE IF NOT EXISTS rental_extension_requests (
+      id INT(11) NOT NULL AUTO_INCREMENT,
+      rental_id INT(11) NOT NULL,
+      customer_id INT(11) NOT NULL,
+      old_end_date DATE NOT NULL,
+      requested_end_date DATE NOT NULL,
+      status ENUM('PENDING','APPROVED','REJECTED') NOT NULL DEFAULT 'PENDING',
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      reviewed_at DATETIME NULL DEFAULT NULL,
+      PRIMARY KEY (id),
+      KEY idx_rental_status (rental_id, status),
+      KEY idx_status (status)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+  ");
+  $map = [];
+  $res = $c->query("
+    SELECT id, rental_id, old_end_date, requested_end_date, status, created_at
+    FROM rental_extension_requests
+    WHERE status = 'PENDING'
+    ORDER BY created_at DESC, id DESC
+  ");
+  if ($res) {
+    while ($row = $res->fetch_assoc()) {
+      $rid = (int)$row['rental_id'];
+      if (!isset($map[$rid])) $map[$rid] = $row;
+    }
+  }
+  return $map;
 }
 
 function fetchCurrentRentalsFromView($c){
@@ -957,9 +1041,20 @@ if($_SERVER['REQUEST_METHOD']==='POST'){
         }
       }
 
-      // Update vehicle status to available (per policy)
-      $vehUpdate = $conn->query("UPDATE vehicles SET current_status='available' WHERE id={$rental['vehicle_id']}");
-      error_log("Vehicle status update result: " . ($vehUpdate ? 'success' : 'failed'));
+      // Update vehicle status to available and sync fuel level from return
+      $vehId = (int)$rental['vehicle_id'];
+      $allowedFuel = ['full','3/4','half','1/4','empty'];
+      $fuelForVehicle = in_array($fuel_level, $allowedFuel, true) ? $fuel_level : 'full';
+      $fuelColCheck = $conn->query("SHOW COLUMNS FROM vehicles LIKE 'fuel_level'");
+      if ($fuelColCheck && $fuelColCheck->num_rows > 0) {
+        $vehUpd = $conn->prepare("UPDATE vehicles SET current_status='available', fuel_level=? WHERE id=?");
+        $vehUpd->bind_param('si', $fuelForVehicle, $vehId);
+        $vehUpdate = $vehUpd->execute();
+        $vehUpd->close();
+      } else {
+        $vehUpdate = $conn->query("UPDATE vehicles SET current_status='available' WHERE id=$vehId");
+      }
+      error_log("Vehicle status/fuel update result: " . ($vehUpdate ? 'success' : 'failed') . " fuel=$fuelForVehicle");
       
       // Check final vehicle status
       $vehCheck = $conn->query("SELECT current_status FROM vehicles WHERE id={$rental['vehicle_id']}")->fetch_assoc();
@@ -1084,7 +1179,7 @@ if($_SERVER['REQUEST_METHOD']==='POST'){
       FROM rentals
       WHERE vehicle_id=$vID
         AND id<>$rID
-        AND status IN ('pending','reserved')
+        AND status IN ('waitlist','pending','reserved')
         AND start_date <= '$newEnd'
     ");
     while($c=$conflicts->fetch_assoc()){
@@ -1115,6 +1210,13 @@ if($_SERVER['REQUEST_METHOD']==='POST'){
 
 /* -------- Render data -------- */
 $rows = fetchRentals($conn);
+$pendingPaymentsByRental = fetchPendingPaymentsByRental($conn);
+$paymentReceiptsByRental = fetchPaymentReceiptsByRental($conn);
+$pendingExtensionsByRental = fetchPendingExtensionsByRental($conn);
+$kpi_pending_receipts = 0;
+foreach ($pendingPaymentsByRental as $list) {
+  $kpi_pending_receipts += count($list);
+}
 
 // CRITICAL: Exit early for AJAX requests to prevent HTML output
 if (isset($_POST['ajax_request']) || (isset($_SERVER['HTTP_X_REQUESTED_WITH']) && strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) == 'xmlhttprequest')) {
@@ -1261,31 +1363,73 @@ a{text-decoration:none;color:inherit}
 .chip .lbl{color:var(--muted);font-weight:700}
 .chip.bad{border-color:rgba(255,107,107,.25);background:rgba(255,107,107,.10)}
 .summary-right{color:var(--muted);font-size:.82rem}
-.table{width:100%;border-collapse:separate;border-spacing:0 12px}
+.table{width:100%;border-collapse:separate;border-spacing:0 10px}
 .thead{
-  display:grid;grid-template-columns: 260px 280px 220px 220px 240px;
-  gap:0;color:var(--muted);font-size:.8rem;margin:6px 0;font-weight:600;text-transform:uppercase;
-  letter-spacing:0.5px;padding:0 16px;
+  display:grid;
+  grid-template-columns: 1.3fr 1.3fr 1.2fr 0.9fr 0.85fr 110px;
+  gap:12px;
+  color:var(--muted);
+  font-size:.75rem;
+  margin:6px 0 10px;
+  font-weight:700;
+  text-transform:uppercase;
+  letter-spacing:0.5px;
+  padding:0 16px;
 }
 .row{
-  display:grid;grid-template-columns: 260px 280px 220px 220px 240px;
-  background:var(--glass-bg);backdrop-filter:blur(10px);
-  border:1px solid var(--glass-border);border-radius:var(--radius);align-items:center;
-  box-shadow:var(--shadow);overflow:visible;position:relative;padding:16px;
-  transition:all 0.3s cubic-bezier(0.4,0,0.2,1);
+  display:grid;
+  grid-template-columns: 1.3fr 1.3fr 1.2fr 0.9fr 0.85fr 110px;
+  gap:12px;
+  background:var(--glass-bg);
+  backdrop-filter:blur(10px);
+  border:1px solid var(--glass-border);
+  border-radius:14px;
+  align-items:center;
+  box-shadow:0 10px 28px rgba(0,0,0,.28);
+  overflow:hidden;
+  position:relative;
+  padding:14px 16px;
+  transition:border-color .15s ease, background .15s ease;
 }
 .row:hover{
-  transform:translateY(-2px);box-shadow:0 20px 40px rgba(0,0,0,.4);
-  border-color:rgba(93,208,255,.2);background:rgba(16,20,25,.9);
+  border-color:rgba(93,208,255,.22);
+  background:rgba(16,20,25,.92);
 }
-.row:nth-child(even){background:rgba(16,20,25,.6);}
-.row:nth-child(even):hover{background:rgba(16,20,25,.8);}
+.row:nth-child(even){background:rgba(16,20,25,.62);}
+.row:nth-child(even):hover{background:rgba(16,20,25,.88);}
+
+.cell{padding:0;border-right:0;position:relative;z-index:1;min-width:0}
+.cell .muted{color:var(--muted);font-size:.78rem;font-weight:600;margin-top:3px}
+.cell .primary{font-weight:800;font-size:.95rem;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cell .schedule-line{font-weight:700;font-size:.88rem;line-height:1.3}
+.cell .total-line{font-weight:800;font-size:1rem;font-variant-numeric:tabular-nums}
+.cell-status{display:flex;flex-direction:column;align-items:flex-start;gap:6px}
+.cell-actions{display:flex;justify-content:flex-end;align-items:center}
+.cell-actions .btn-view{
+  background:rgba(255,255,255,.08);
+  color:var(--text);
+  border:1px solid rgba(255,255,255,.16);
+  padding:8px 14px;
+  border-radius:10px;
+  font-weight:700;
+  font-size:.8rem;
+  margin:0;
+}
+.cell-actions .btn-view:hover{
+  border-color:rgba(93,208,255,.4);
+  background:rgba(93,208,255,.12);
+  color:var(--brand);
+}
+.rental-actions-source{display:none !important}
 
 /* Status Badges */
 .status{
-  display:inline-flex;align-items:center;gap:6px;padding:6px 12px;border-radius:20px;
-  font-size:.75rem;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;
-  border:1px solid;transition:all 0.2s ease;
+  display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:999px;
+  font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:0.4px;
+  border:1px solid;margin:0;width:auto;line-height:1.2;
+}
+.status.s-waitlist{
+  background:rgba(148,163,184,.16);color:#e2e8f0;border-color:rgba(148,163,184,.35);
 }
 .status.s-pending{
   background:rgba(255,165,0,.15);color:#ffd166;border-color:rgba(255,165,0,.3);
@@ -1302,6 +1446,13 @@ a{text-decoration:none;color:inherit}
 .status.s-cancelled{
   background:rgba(239,68,68,.15);color:#ef4444;border-color:rgba(239,68,68,.3);
 }
+.due-pill{
+  display:inline-flex;align-items:center;padding:3px 8px;border-radius:999px;
+  font-size:.65rem;font-weight:800;letter-spacing:.3px;text-transform:uppercase;
+}
+.due-pill.overdue{background:rgba(239,68,68,.18);color:#ff8f8f;border:1px solid rgba(239,68,68,.35)}
+.due-pill.due-today{background:rgba(255,107,107,.16);color:#ffb4b4;border:1px solid rgba(255,107,107,.3)}
+.due-pill.due-soon{background:rgba(255,209,102,.14);color:#ffd166;border:1px solid rgba(255,209,102,.28)}
 
 /* Action Buttons */
 .btn{
@@ -1333,6 +1484,8 @@ a{text-decoration:none;color:inherit}
 .pay-awaiting{background:rgba(255,165,0,.14);color:#ffd166;border-color:rgba(255,165,0,.25);}
 .pay-partial{background:rgba(59,130,246,.16);color:#9edcff;border-color:rgba(59,130,246,.28);}
 .pay-ready{background:rgba(16,185,129,.16);color:#7cffc7;border-color:rgba(16,185,129,.28);}
+.pay-review{background:rgba(168,85,247,.16);color:#e9d5ff;border-color:rgba(168,85,247,.30);}
+.ext-pending{background:rgba(245,158,11,.16);color:#ffd084;border-color:rgba(245,158,11,.30);}
 
 /* Record Payment */
 .paybtn{
@@ -1341,7 +1494,22 @@ a{text-decoration:none;color:inherit}
   border:1px solid rgba(255,255,255,.10);
 }
 .paybtn:hover{background:rgba(255,255,255,.09)}
+.pay-review-btn{
+  background:rgba(168,85,247,.18);
+  color:#e9d5ff;
+  border:1px solid rgba(168,85,247,.35);
+}
+.pay-review-btn:hover{background:rgba(168,85,247,.28)}
 .pay-modal{width:min(520px,94vw)}
+.review-modal{width:min(640px,94vw);max-height:90vh;overflow-y:auto;text-align:left}
+.review-proof{
+  margin:12px 0;border-radius:14px;border:1px solid rgba(255,255,255,.12);
+  background:rgba(0,0,0,.25);padding:10px;text-align:center;
+}
+.review-proof img{max-width:100%;max-height:320px;object-fit:contain;border-radius:10px}
+.review-meta{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:12px 0}
+.review-meta .pay-card .v{word-break:break-word}
+.review-notes{margin-top:8px;color:var(--muted);font-size:.85rem;font-weight:700}
 .pay-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:12px 0 4px}
 .pay-card{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:10px 12px}
 .pay-card .k{color:var(--muted);font-size:.75rem;font-weight:700}
@@ -1375,106 +1543,114 @@ a{text-decoration:none;color:inherit}
 .financial .balance{color:var(--muted);font-size:.8rem;}
 
 /* Responsive Design */
-@media (max-width: 1200px) {
+@media (max-width: 1100px) {
   .thead, .row {
-    grid-template-columns: 220px 240px 200px 200px 220px;
+    grid-template-columns: 1.2fr 1.2fr 1.1fr 0.85fr 0.8fr 100px;
     font-size: .8rem;
   }
 }
 
-@media (max-width: 992px) {
-  .thead, .row {
+@media (max-width: 900px) {
+  .thead { display: none; }
+  .row {
     grid-template-columns: 1fr;
-    font-size: .75rem;
+    gap: 10px;
+    padding: 14px;
   }
-  .cell {
-    padding: 8px;
+  .cell-actions{justify-content:stretch}
+  .cell-actions .btn-view{width:100%;justify-content:center}
+  .cell[data-label]::before{
+    content: attr(data-label);
+    display:block;
+    color:var(--muted);
+    font-size:.68rem;
+    font-weight:700;
+    text-transform:uppercase;
+    letter-spacing:.4px;
+    margin-bottom:4px;
   }
 }
 
 @media (max-width: 768px) {
-  .wrap {
-    padding: 16px;
-  }
-  h1 {
-    font-size: 1.5rem;
-  }
-  .filterbar {
-    padding: 16px;
-  }
-  .thead, .row {
-    grid-template-columns: 1fr;
-    gap: 8px;
-  }
-  .thead {
-    display: none;
-  }
-  .row {
-    display: block;
-    margin-bottom: 12px;
-    padding: 12px;
-  }
-  .cell {
-    display: flex;
-    justify-content: space-between;
-    padding: 8px 12px;
-    border-right: none;
-    border-bottom: 1px solid rgba(255,255,255,.06);
-  }
-  .cell:last-child {
-    border-bottom: none;
-  }
-  .cell::before {
-    content: attr(data-label);
-    font-weight: 600;
-    color: var(--muted);
-    margin-right: 12px;
-  }
+  .wrap { padding: 16px; }
+  h1 { font-size: 1.5rem; }
+  .filterbar { padding: 16px; }
 }
-.cell{padding:12px;border-right:1px solid rgba(255,255,255,.06);position:relative;z-index:1} .cell:last-child{border-right:0;overflow:visible}
-.cell .btn{margin:2px;display:inline-block;white-space:nowrap}
-.cell:last-child{display:flex;flex-direction:column;gap:8px;align-items:flex-start;min-height:100px;overflow:visible;position:relative;width:auto}
-.cell:last-child .status{margin-bottom:4px;width:auto;word-wrap:break-word;line-height:1.2}
-.cell:last-child .btn{margin-top:4px;margin-bottom:2px}
 .muted{color:var(--muted);font-size:.85rem}
 
-.actions-stack{display:flex;flex-direction:column;gap:6px;margin-top:10px;min-width:160px}
+.actions-stack{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 .actions-stack form{margin:0}
-.actions-stack .btn{width:fit-content}
+.actions-stack .btn{width:auto;margin:0}
 
-/* Details Drawer */
-.drawer-bg{position:fixed;inset:0;background:rgba(5,10,15,.55);backdrop-filter:blur(6px);display:none;z-index:1100}
-.drawer{
-  position:fixed;top:0;right:0;height:100vh;width:min(420px,92vw);
-  background:linear-gradient(180deg,#0f141a,#0b0f14);
-  border-left:1px solid rgba(255,255,255,.10);
-  box-shadow:-24px 0 60px rgba(0,0,0,.55);
-  transform:translateX(100%);
-  transition:transform .25s ease;
-  z-index:1101;
+/* Rental View Modal */
+.view-modal-bg{
+  position:fixed;inset:0;background:rgba(5,10,15,.72);backdrop-filter:blur(8px);
+  display:none;align-items:center;justify-content:center;z-index:1100;padding:18px;
+}
+.view-modal-bg.open{display:flex}
+.view-modal{
+  width:min(760px,96vw);max-height:90vh;overflow:auto;text-align:left;
+  background:linear-gradient(180deg,#121820,#0c1016);
+  border:1px solid rgba(255,255,255,.12);border-radius:18px;
+  box-shadow:0 28px 70px rgba(0,0,0,.55);
   display:flex;flex-direction:column;
 }
-.drawer-bg.open{display:block}
-.drawer.open{transform:translateX(0)}
-.drawer-head{padding:16px 16px 12px;border-bottom:1px solid rgba(255,255,255,.08);display:flex;align-items:flex-start;justify-content:space-between;gap:10px}
-.drawer-title{font-weight:900;font-size:1.05rem;line-height:1.1}
-.drawer-sub{color:var(--muted);font-size:.85rem;margin-top:6px;line-height:1.3}
-.drawer-close{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.14);color:var(--text);border-radius:10px;padding:8px 10px;cursor:pointer;font-weight:800}
-.drawer-body{padding:14px 16px;overflow:auto}
-.kv{display:flex;justify-content:space-between;gap:10px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.06)}
-.kv .k{color:var(--muted);font-size:.82rem;font-weight:700}
-.kv .v{font-weight:800}
-.drawer-actions{padding:14px 16px;border-top:1px solid rgba(255,255,255,.08);display:flex;gap:10px;flex-wrap:wrap}
-.drawer-actions .btn{flex:1}
-
-.status{
-  display:inline-flex;align-items:center;gap:6px;padding:.28rem .6rem;border-radius:999px;font-weight:800;font-size:.72rem;
-  margin-bottom:6px;width:auto;word-wrap:break-word;line-height:1.2;
+.view-modal-head{
+  padding:18px 20px 14px;border-bottom:1px solid rgba(255,255,255,.08);
+  display:flex;align-items:flex-start;justify-content:space-between;gap:12px;
 }
-.s-pending,.s-reserved{background:rgba(93,208,255,.14);color:#87e1ff}
-.s-ongoing{background:rgba(255,209,102,.18);color:#ffd166}
-.s-completed{background:rgba(124,255,199,.18);color:#7cffc7}
-.s-cancelled{background:rgba(255,107,107,.18);color:#ff9b9b}
+.view-modal-title{font-weight:900;font-size:1.15rem;line-height:1.15;margin:0}
+.view-modal-sub{color:var(--muted);font-size:.88rem;margin-top:6px;line-height:1.35;font-weight:600}
+.view-modal-close{
+  background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.14);color:var(--text);
+  border-radius:10px;padding:8px 12px;cursor:pointer;font-weight:800;flex-shrink:0;
+}
+.view-modal-body{padding:16px 20px;overflow:auto}
+.view-section{margin-bottom:16px}
+.view-section:last-child{margin-bottom:0}
+.view-section-title{
+  font-size:.72rem;font-weight:800;text-transform:uppercase;letter-spacing:.5px;
+  color:var(--muted);margin:0 0 10px;
+}
+.view-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.view-card{
+  background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);
+  border-radius:12px;padding:12px 14px;
+}
+.view-card .k{color:var(--muted);font-size:.72rem;font-weight:700;margin:0 0 4px}
+.view-card .v{color:var(--text);font-size:.95rem;font-weight:800;margin:0;word-break:break-word}
+.view-card .v.em{font-size:1.05rem}
+.view-badges{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+.view-receipts{display:flex;flex-direction:column;gap:12px}
+.view-receipt-card{
+  background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);
+  border-radius:12px;padding:12px;overflow:hidden;
+}
+.view-receipt-meta{
+  display:flex;flex-wrap:wrap;gap:8px 14px;margin-bottom:10px;
+  font-size:.8rem;font-weight:700;color:var(--muted);
+}
+.view-receipt-meta strong{color:var(--text);font-weight:800}
+.view-receipt-img{
+  width:100%;max-height:360px;object-fit:contain;border-radius:10px;
+  background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.08);display:block;
+}
+.view-receipt-empty{
+  text-align:center;padding:22px 12px;color:var(--muted);font-weight:700;font-size:.9rem;
+  background:rgba(255,255,255,.03);border:1px dashed rgba(255,255,255,.12);border-radius:12px;
+}
+.view-modal-actions{
+  padding:14px 20px 18px;border-top:1px solid rgba(255,255,255,.08);
+  display:flex;gap:8px;flex-wrap:wrap;align-items:center;
+}
+.view-modal-actions .btn{margin:0}
+.view-modal-actions .btn-secondary{
+  background:rgba(255,255,255,.08);color:var(--text);border:1px solid rgba(255,255,255,.14);
+}
+@media (max-width: 640px){
+  .view-grid{grid-template-columns:1fr}
+}
+
 .future{font-size:.72rem;background:rgba(93,208,255,.10);color:#7ad8ff;padding:.12rem .4rem;border-radius:6px}
 .countdown{font-size:.72rem;color:#88a8bd}
 
@@ -1485,7 +1661,7 @@ a{text-decoration:none;color:inherit}
 .btn-start{background:#22425a;color:#9edcff;border:1px solid rgba(255,255,255,.08)}
 .btn-complete{background:#18321f;color:#7cffc7;border:1px solid rgba(255,255,255,.08)}
 .btn-extend{background:#3a2b12;color:#ffd166;border:1px solid rgba(255,255,255,.08)}
-.btn-receipt{background:#0f2a3a;color:#7dd3fc;border:1px solid rgba(255,255,255,.08);margin-top:8px;display:block;width:fit-content}
+.btn-receipt{background:#0f2a3a;color:#7dd3fc;border:1px solid rgba(255,255,255,.08);display:inline-flex;width:fit-content;margin-top:0}
 
 .badgeOK{background:rgba(124,255,199,.15);color:#7cffc7;border:1px solid rgba(124,255,199,.25)}
 .badgeWARN{background:rgba(255,209,102,.15);color:#ffd166;border:1px solid rgba(255,209,102,.25)}
@@ -1508,61 +1684,158 @@ a{text-decoration:none;color:inherit}
 
 /* Return Modal Styles */
 .return-modal{
-  width:min(500px,94vw);
+  width:min(720px,96vw);
   text-align:left;
-  max-height:90vh;
-  overflow-y:auto;
+  max-height:min(92vh,900px);
+  overflow:hidden;
+  display:flex;
+  flex-direction:column;
+  padding:0 !important;
 }
 .return-modal h2{
-  text-align:center;
-  margin-bottom:20px;
-  color:#7cffc7;
-  font-size:1.4rem;
+  text-align:left;
+  margin:0;
+  color:#f2f6fa;
+  font-size:1.2rem;
+  font-weight:800;
+  letter-spacing:-.02em;
 }
+.return-modal__head{
+  padding:18px 20px 14px;
+  border-bottom:1px solid rgba(255,255,255,.08);
+  display:flex;
+  justify-content:space-between;
+  align-items:flex-start;
+  gap:12px;
+  flex-shrink:0;
+}
+.return-modal__sub{
+  margin-top:4px;
+  color:#9aa6b3;
+  font-size:.82rem;
+  font-weight:600;
+}
+.return-modal__body{
+  padding:16px 20px;
+  overflow-y:auto;
+  flex:1;
+  min-height:0;
+}
+.return-modal__foot{
+  padding:14px 20px 16px;
+  border-top:1px solid rgba(255,255,255,.08);
+  background:rgba(0,0,0,.22);
+  flex-shrink:0;
+}
+.rm-section{
+  margin-bottom:16px;
+  padding:14px 14px 6px;
+  border:1px solid rgba(255,255,255,.08);
+  border-radius:14px;
+  background:rgba(255,255,255,.02);
+}
+.rm-section:last-child{margin-bottom:0}
+.rm-section__title{
+  margin:0 0 12px;
+  font-size:.72rem;
+  font-weight:800;
+  letter-spacing:.5px;
+  text-transform:uppercase;
+  color:#7cffc7;
+}
+.rm-charges{
+  display:grid;
+  grid-template-columns:repeat(3,minmax(0,1fr));
+  gap:8px;
+  margin-bottom:10px;
+}
+.rm-charge{
+  background:rgba(255,255,255,.03);
+  border:1px solid rgba(255,255,255,.07);
+  border-radius:10px;
+  padding:10px 12px;
+}
+.rm-charge .k{
+  color:#9aa6b3;
+  font-size:.68rem;
+  font-weight:700;
+  text-transform:uppercase;
+  letter-spacing:.35px;
+  margin-bottom:4px;
+}
+.rm-charge .v{
+  color:#f2f6fa;
+  font-size:.95rem;
+  font-weight:800;
+}
+.rm-charge.accent .v{color:#7cffc7}
+.rm-charge.warn .v{color:#ffd166}
+.rm-totals{
+  display:grid;
+  grid-template-columns:repeat(3,minmax(0,1fr));
+  gap:8px;
+  padding-top:8px;
+  border-top:1px dashed rgba(255,255,255,.1);
+}
+.rm-hint{
+  margin-top:10px;
+  color:#9aa6b3;
+  font-size:.78rem;
+}
+.rm-meter{
+  display:flex;
+  gap:10px;
+  align-items:center;
+  flex-wrap:wrap;
+  margin-bottom:12px;
+  padding:8px 10px;
+  border-radius:10px;
+  background:rgba(93,208,255,.06);
+  border:1px solid rgba(93,208,255,.12);
+  color:#9aa6b3;
+  font-size:.8rem;
+  font-weight:600;
+}
+.rm-meter strong{color:#e2e8f0;font-weight:800}
 .form-row{
   display:grid;
   grid-template-columns:1fr 1fr;
   gap:12px;
-  margin-bottom:16px;
+  margin-bottom:12px;
 }
 .form-group{
   display:flex;
   flex-direction:column;
+  margin-bottom:10px;
 }
 .form-group label{
-  font-size:.85rem;
-  font-weight:600;
-  color:#9ca3af;
+  font-size:.8rem;
+  font-weight:700;
+  color:#9aa6b3;
   margin-bottom:6px;
 }
 .form-group input,
 .form-group select,
 .form-group textarea{
-  background:rgba(255,255,255,.08);
-  border:1px solid rgba(255,255,255,.25);
-  border-radius:8px;
+  background:rgba(255,255,255,.06);
+  border:1px solid rgba(255,255,255,.18);
+  border-radius:10px;
   padding:10px 12px;
   color:#fff;
   font-size:.9rem;
   transition:all .2s;
 }
-.form-group select{
-  background:rgba(255,255,255,.1);
-  border:1px solid rgba(255,255,255,.3);
-  color:#fff;
-}
 .form-group select option{
   background:#1e293b;
   color:#fff;
-  padding:8px;
 }
 .form-group input:focus,
 .form-group select:focus,
 .form-group textarea:focus{
   outline:none;
-  border-color:#3b82f6;
-  background:rgba(255,255,255,.12);
-  box-shadow:0 0 0 3px rgba(59,130,246,.1);
+  border-color:#5dd0ff;
+  background:rgba(255,255,255,.09);
+  box-shadow:0 0 0 3px rgba(93,208,255,.12);
 }
 .form-group input::placeholder,
 .form-group textarea::placeholder{
@@ -1570,13 +1843,44 @@ a{text-decoration:none;color:inherit}
 }
 .form-group textarea{
   resize:vertical;
-  min-height:60px;
+  min-height:56px;
 }
 .return-modal .actions{
-  margin-top:20px;
+  margin-top:0;
   display:flex;
   gap:10px;
-  justify-content:center;
+  justify-content:flex-end;
+  align-items:center;
+}
+.rm-check{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  color:#cbd5e1;
+  font-size:.85rem;
+  font-weight:600;
+  margin:4px 0 10px;
+}
+.rm-check input{accent-color:#5dd0ff}
+#fuelChargeDisplay{
+  margin-top:8px;
+  padding:8px 10px;
+  background:rgba(93,208,255,.08);
+  border-radius:8px;
+  border-left:3px solid #5dd0ff;
+  display:none;
+  font-size:.82rem;
+}
+#washSummary{
+  color:#5dd0ff;
+  font-weight:700;
+  font-size:.82rem;
+  min-height:1.2em;
+  margin-top:4px;
+}
+@media (max-width:640px){
+  .form-row,.rm-charges,.rm-totals{grid-template-columns:1fr}
+  .return-modal{width:min(100vw - 16px,720px)}
 }
 
 /* Receipt Modal Styles */
@@ -1773,6 +2077,61 @@ a{text-decoration:none;color:inherit}
 }
 .rental-row{
   position:relative;
+}
+
+.pagination{
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  flex-wrap:wrap;
+  gap:8px;
+  margin:22px 0 8px;
+}
+.pagination a,
+.pagination button,
+.pagination span{
+  min-width:40px;
+  height:40px;
+  padding:0 12px;
+  border-radius:12px;
+  border:1px solid rgba(255,255,255,0.14);
+  background:rgba(255,255,255,0.04);
+  color:rgba(242,246,250,0.88);
+  font-family:Inter, system-ui, sans-serif;
+  font-size:0.9rem;
+  font-weight:500;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  text-decoration:none;
+  cursor:pointer;
+  transition:all .15s ease;
+}
+.pagination a:hover,
+.pagination button:hover{
+  border-color:rgba(93,208,255,0.4);
+  background:rgba(93,208,255,0.1);
+  color:var(--brand);
+}
+.pagination .active{
+  background:linear-gradient(135deg, var(--brand), var(--brand2));
+  border-color:transparent;
+  color:#04121b;
+  font-weight:700;
+  box-shadow:0 8px 20px rgba(93,208,255,0.18);
+  cursor:default;
+}
+.pagination .disabled{
+  opacity:0.4;
+  pointer-events:none;
+  cursor:default;
+}
+.pagination-info{
+  text-align:center;
+  margin:8px 0 18px;
+  color:rgba(242,246,250,0.6);
+  font-size:0.85rem;
+  font-weight:500;
 }
 
 /* Notification Banner Styles */
@@ -2451,6 +2810,7 @@ a{text-decoration:none;color:inherit}
     <div class="filterbar-filters">
       <select id="statusFilter">
         <option value="">All Status</option>
+        <option value="waitlist">Waitlist</option>
         <option value="pending">Pending</option>
         <option value="reserved">Reserved</option>
         <option value="ongoing">Ongoing</option>
@@ -2482,11 +2842,12 @@ a{text-decoration:none;color:inherit}
   <!-- Rentals table -->
   <div class="card">
     <div class="thead">
-      <div><b>Customer</b></div>
-      <div><b>Vehicle</b></div>
-      <div><b>Schedule</b></div>
-      <div><b>Cost</b></div>
-      <div><b>Status / Actions</b></div>
+      <div>Customer</div>
+      <div>Vehicle</div>
+      <div>Schedule</div>
+      <div>Total</div>
+      <div>Status</div>
+      <div>Actions</div>
     </div>
 
     <div id="rows">
@@ -2549,35 +2910,47 @@ a{text-decoration:none;color:inherit}
             'total' => (float)$total_amount,
             'days' => (int)$days,
             'status' => (string)$st,
+            'cancel_reason' => (string)($r['cancel_reason'] ?? ''),
+            'cancelled_at' => (string)($r['cancelled_at'] ?? ''),
+            'receipts' => $paymentReceiptsByRental[(int)$r['id']] ?? [],
           ];
-          $drawerDataEsc = htmlspecialchars(json_encode($drawerData), ENT_QUOTES, 'UTF-8');
+          $drawerDataEsc = htmlspecialchars(json_encode($drawerData, JSON_UNESCAPED_SLASHES), ENT_QUOTES, 'UTF-8');
           
           // Debug: Show rental status in console (removed to prevent HTML interference)
 
           echo '<div class="row rental-row" data-rental="'.$drawerDataEsc.'" data-start-date="'.h($r['start_date']).'" data-end-date="'.h($r['end_date']).'" '.($isAdvance ? 'data-start="'.h($r['start_date']).'"' : '').'>';
-          
-          // Add return due indicator if applicable
-          if ($return_indicator) {
-            echo '<div class="return-due-indicator '.$return_indicator_class.'">'.$return_indicator.'</div>';
-          }
-          echo '<div class="cell" data-label="Customer"><b>'.h($r['full_name']).'</b><div class="muted">Rental #'.(int)$r['id'].'</div></div>';
-          echo '<div class="cell" data-label="Vehicle"><div><b>'.h($r['make_model']).'</b></div><div class="muted">Plate: '.h($r['plate_no']).'</div></div>';
-          echo '<div class="cell" data-label="Schedule"><div><b>'.h($r['start_date']).'</b> → <b>'.h($r['end_date']).'</b></div><div class="muted">'.(int)$days.' day(s)</div></div>';
-          echo '<div class="cell financial" data-label="Cost">';
-          echo '<div class="total">₱'.hnum($total_amount,2).'</div>';
-          echo '<div class="balance">Rate: ₱'.hnum($r['daily_rate'],2).'/day</div>';
-          echo '<div class="down">Required Down: ₱'.hnum($required_down,2).' • Paid: ₱'.hnum($paid_amount,2).' • Balance: ₱'.hnum($balance_calc,2).'</div>';
-          echo '</div>';
-          echo '<div class="cell" data-label="Status">';
 
-          // Status chip + advance hints
+          echo '<div class="cell" data-label="Customer"><div class="primary">'.h($r['full_name']).'</div><div class="muted">#'.(int)$r['id'].'</div></div>';
+          echo '<div class="cell" data-label="Vehicle"><div class="primary">'.h($r['make_model']).'</div><div class="muted">'.h($r['plate_no']).'</div></div>';
+          echo '<div class="cell" data-label="Schedule"><div class="schedule-line">'.h($r['start_date']).' → '.h($r['end_date']).'</div><div class="muted">'.(int)$days.' day'.(((int)$days===1)?'':'s').'</div></div>';
+          echo '<div class="cell" data-label="Total"><div class="total-line">₱'.hnum($total_amount,2).'</div></div>';
+
+          echo '<div class="cell cell-status" data-label="Status">';
           echo '<div class="status '.$sclass.'">'.ucfirst($st);
-          if($isAdvance) echo ' <span class="future">Advance</span> <span class="countdown" data-start="'.h($r['start_date']).'">—</span>';
+          if($isAdvance) echo ' <span class="future">Advance</span>';
+          echo '</div>';
+          if ($return_indicator) {
+            echo '<span class="due-pill '.$return_indicator_class.'">'.h($return_indicator).'</span>';
+          }
           echo '</div>';
 
-          // Payment readiness badges (pending rentals)
-          if($st==='pending'){
-            if ($paid_amount <= 0.00001) {
+          echo '<div class="cell cell-actions" data-label="Actions">';
+          echo '<button class="btn btn-view" type="button" onclick="openRentalView(this)">View</button>';
+          echo '</div>';
+
+          // Full details + action controls live in the View modal
+          $pendingProofs = $pendingPaymentsByRental[(int)$r['id']] ?? [];
+          $hasPendingProof = !empty($pendingProofs);
+          $pendingExt = $pendingExtensionsByRental[(int)$r['id']] ?? null;
+          $hasPendingExtension = !empty($pendingExt);
+
+          echo '<div class="rental-actions-source" hidden>';
+          if($st==='waitlist'){
+            echo '<div class="pay-badge pay-awaiting">Awaiting Payment</div>';
+          } elseif($st==='pending'){
+            if ($hasPendingProof) {
+              echo '<div class="pay-badge pay-review">Receipt Under Review</div>';
+            } elseif ($paid_amount <= 0.00001) {
               echo '<div class="pay-badge pay-awaiting">Awaiting Downpayment</div>';
             } elseif ($paid_amount + 0.00001 < $required_down) {
               echo '<div class="pay-badge pay-partial">Partial Downpayment</div>';
@@ -2585,14 +2958,38 @@ a{text-decoration:none;color:inherit}
               echo '<div class="pay-badge pay-ready">Ready for Approval</div>';
             }
           }
+          if($st==='ongoing' && $hasPendingExtension){
+            echo '<div class="pay-badge ext-pending">Extension Pending → '.h(date('M d, Y', strtotime((string)$pendingExt['requested_end_date']))).'</div>';
+          }
 
-          // Actions
           echo '<div class="actions-stack">';
-          echo '<button class="btn btn-secondary" type="button" onclick="openRentalDrawer(this)">View</button>';
-          if($st==='pending'){
-            // Determine initial status based on start date
+          if($st==='waitlist'){
+            echo '<span class="muted">Waiting for the customer to submit a receipt.</span>';
+            echo '<form method="post"><input type="hidden" name="rental_id" value="'.(int)$r['id'].'">';
+            echo '<input type="hidden" name="vehicle_id" value="'.(int)$r['vehicle_id'].'">';
+            echo '<input type="hidden" name="new_status" value="cancelled">';
+            echo '<button class="btn btn-cancel">Cancel</button></form>';
+          } elseif($st==='pending'){
             $initialStatus = (strtotime($r['start_date']) > strtotime($today)) ? 'reserved' : 'ongoing';
             $canApprove = ($paid_amount + 0.00001 >= $required_down);
+            if ($hasPendingProof) {
+              $firstProof = $pendingProofs[0];
+              $proofJson = htmlspecialchars(json_encode([
+                'payment_id' => (int)$firstProof['payment_id'],
+                'rental_id' => (int)$r['id'],
+                'customer' => (string)$r['full_name'],
+                'vehicle' => (string)$r['make_model'],
+                'amount' => (float)$firstProof['amount'],
+                'method' => (string)($firstProof['payment_method'] ?? ''),
+                'reference_no' => (string)($firstProof['reference_no'] ?? ''),
+                'notes' => (string)($firstProof['notes'] ?? ''),
+                'proof_image' => (string)($firstProof['proof_image'] ?? ''),
+                'paid_at' => (string)($firstProof['paid_at'] ?? ''),
+                'required_down' => (float)$required_down,
+                'paid_amount' => (float)$paid_amount,
+              ], JSON_UNESCAPED_SLASHES), ENT_QUOTES, 'UTF-8');
+              echo '<button class="btn pay-review-btn" type="button" data-payment="'.$proofJson.'" onclick="openReviewPaymentModal(this)">Review Receipt</button>';
+            }
             echo '<button class="btn paybtn" type="button" onclick="openPaymentModal('.(int)$r['id'].','.(float)$required_down.','.(float)$paid_amount.')">Record Payment</button>';
             echo '<form method="post"><input type="hidden" name="rental_id" value="'.(int)$r['id'].'">';
             echo '<input type="hidden" name="vehicle_id" value="'.(int)$r['vehicle_id'].'">';
@@ -2615,44 +3012,58 @@ a{text-decoration:none;color:inherit}
             echo '<button class="btn btn-cancel">Cancel</button></form>';
           } elseif($st==='reserved' && $isAdvance){
             echo '<span class="muted">Awaiting start</span>';
+            if($isAdvance) echo ' <span class="countdown" data-start="'.h($r['start_date']).'">—</span>';
             echo '<form method="post"><input type="hidden" name="rental_id" value="'.(int)$r['id'].'">';
             echo '<input type="hidden" name="vehicle_id" value="'.(int)$r['vehicle_id'].'">';
             echo '<input type="hidden" name="new_status" value="cancelled">';
             echo '<button class="btn btn-cancel">Cancel</button></form>';
           } elseif($st==='ongoing'){
-            $returnBtn = '<button class="btn btn-return" type="button" onclick="openReturnModal('.(int)$r['id'].',\''.h($r['make_model']).'\',\''.h($r['plate_no']).'\',\''.h($r['end_date']).'\',\''.h($r['end_time']??'23:59:59').'\','.(int)$r['vehicle_id'].',\''.h($r['vehicle_type']).'\')">Return</button>';
-            echo $returnBtn;
+            echo '<button class="btn btn-return" type="button" onclick="openReturnModal('.(int)$r['id'].',\''.h($r['make_model']).'\',\''.h($r['plate_no']).'\',\''.h($r['end_date']).'\',\''.h($r['end_time']??'23:59:59').'\','.(int)$r['vehicle_id'].',\''.h($r['vehicle_type']).'\')">Return</button>';
 
-            echo '<button class="btn btn-extend" type="button" onclick="openExtendModalFromRow(this)">Extend</button>';
+            if ($hasPendingExtension) {
+              $extJson = htmlspecialchars(json_encode([
+                'request_id' => (int)$pendingExt['id'],
+                'rental_id' => (int)$r['id'],
+                'customer' => (string)$r['full_name'],
+                'vehicle' => (string)$r['make_model'],
+                'old_end_date' => (string)$pendingExt['old_end_date'],
+                'requested_end_date' => (string)$pendingExt['requested_end_date'],
+                'created_at' => (string)($pendingExt['created_at'] ?? ''),
+              ], JSON_UNESCAPED_SLASHES), ENT_QUOTES, 'UTF-8');
+              echo '<button class="btn pay-review-btn" type="button" data-extension="'.$extJson.'" onclick="openReviewExtensionModal(this)">Review Extension</button>';
+            } else {
+              echo '<button class="btn btn-extend" type="button" onclick="openExtendModalFromRow(this)">Extend</button>';
+            }
           } elseif($st==='completed'){
-            echo '<span class="muted" style="color:#7cffc7;font-weight:600;font-size:.7rem;">Completed</span>';
             echo '<button class="btn btn-receipt" type="button" onclick="viewReceipt('.(int)$r['id'].')">Receipt</button>';
-          } else {
-            echo '<span class="muted">—</span>';
           }
-          echo '</div>'; // actions
+          echo '</div>'; // actions-stack
+          echo '</div>'; // rental-actions-source
 
-          echo   '</div>'; // status/actions cell
           echo '</div>';   // row
         }
       }
       ?>
     </div>
   </div>
+
+  <nav class="pagination" id="rentalsPagination" aria-label="Rental pages" hidden></nav>
+  <div class="pagination-info" id="rentalsPaginationInfo" hidden></div>
 </div>
 
-<!-- Details Drawer -->
-<div class="drawer-bg" id="rentalDrawerBg" onclick="closeRentalDrawer()"></div>
-<div class="drawer" id="rentalDrawer" role="dialog" aria-modal="true" aria-label="Rental details">
-  <div class="drawer-head">
-    <div>
-      <div class="drawer-title" id="drawerTitle">Rental</div>
-      <div class="drawer-sub" id="drawerSub">—</div>
+<!-- Rental View Modal -->
+<div class="view-modal-bg" id="rentalViewBg" onclick="closeRentalView()">
+  <div class="view-modal" id="rentalViewModal" role="dialog" aria-modal="true" aria-label="Rental details" onclick="event.stopPropagation()">
+    <div class="view-modal-head">
+      <div>
+        <h2 class="view-modal-title" id="viewTitle">Rental</h2>
+        <div class="view-modal-sub" id="viewSub">—</div>
+      </div>
+      <button class="view-modal-close" type="button" onclick="closeRentalView()">Close</button>
     </div>
-    <button class="drawer-close" type="button" onclick="closeRentalDrawer()">Close</button>
+    <div class="view-modal-body" id="viewBody"></div>
+    <div class="view-modal-actions" id="viewActions"></div>
   </div>
-  <div class="drawer-body" id="drawerBody"></div>
-  <div class="drawer-actions" id="drawerActions"></div>
 </div>
 
 <!-- Toast -->
@@ -2695,6 +3106,50 @@ a{text-decoration:none;color:inherit}
         <button type="button" class="btn btn-cancel" onclick="closePaymentModal()">Cancel</button>
       </div>
     </form>
+  </div>
+</div>
+
+<!-- Review Customer Receipt Modal -->
+<div class="modal-bg" id="reviewPaymentModal">
+  <div class="modal review-modal">
+    <h2>Review Payment Receipt</h2>
+    <p style="margin-top:-6px;color:var(--muted)">Submitted by <b id="reviewCustomer">—</b> for <b id="reviewVehicle">—</b></p>
+    <div class="review-meta">
+      <div class="pay-card"><div class="k">Amount</div><div class="v" id="reviewAmount">₱0.00</div></div>
+      <div class="pay-card"><div class="k">Method</div><div class="v" id="reviewMethod">—</div></div>
+      <div class="pay-card"><div class="k">Reference</div><div class="v" id="reviewReference">—</div></div>
+      <div class="pay-card"><div class="k">Submitted</div><div class="v" id="reviewPaidAt">—</div></div>
+    </div>
+    <div class="review-notes" id="reviewNotes"></div>
+    <div class="review-proof">
+      <img id="reviewProofImg" src="" alt="Payment receipt">
+    </div>
+    <input type="hidden" id="reviewPaymentId" value="">
+    <div class="actions" style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap">
+      <button class="btn btn-approve" type="button" id="reviewApproveBtn" onclick="submitReviewPayment('approve')">Verify Payment</button>
+      <button class="btn btn-cancel" type="button" id="reviewRejectBtn" onclick="submitReviewPayment('reject')">Reject</button>
+      <button class="btn btn-secondary" type="button" onclick="closeReviewPaymentModal()">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Review Extension Request Modal -->
+<div class="modal-bg" id="reviewExtensionModal">
+  <div class="modal review-modal">
+    <h2>Review Extension Request</h2>
+    <p style="margin-top:-6px;color:var(--muted)">Requested by <b id="extReviewCustomer">—</b> for <b id="extReviewVehicle">—</b></p>
+    <div class="review-meta">
+      <div class="pay-card"><div class="k">Current End</div><div class="v" id="extReviewOldEnd">—</div></div>
+      <div class="pay-card"><div class="k">Requested End</div><div class="v" id="extReviewNewEnd">—</div></div>
+      <div class="pay-card"><div class="k">Submitted</div><div class="v" id="extReviewCreated">—</div></div>
+      <div class="pay-card"><div class="k">Rental #</div><div class="v" id="extReviewRentalId">—</div></div>
+    </div>
+    <input type="hidden" id="extReviewRequestId" value="">
+    <div class="actions" style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap">
+      <button class="btn btn-approve" type="button" id="extApproveBtn" onclick="submitReviewExtension('approve')">Approve Extension</button>
+      <button class="btn btn-cancel" type="button" id="extRejectBtn" onclick="submitReviewExtension('reject')">Reject</button>
+      <button class="btn btn-secondary" type="button" onclick="closeReviewExtensionModal()">Close</button>
+    </div>
   </div>
 </div>
 
@@ -2821,10 +3276,15 @@ a{text-decoration:none;color:inherit}
 <!-- Return Inspection Modal -->
 <div class="modal-bg" id="returnModal">
   <div class="modal return-modal">
-    <h2 id="returnModalTitle">Return Vehicle</h2>
-    
-    <!-- Inspection Form -->
-    <form method="post" id="returnForm">
+    <div class="return-modal__head">
+      <div>
+        <h2 id="returnModalTitle">Return Vehicle</h2>
+        <div class="return-modal__sub">Enter return details, then review charges before completing.</div>
+      </div>
+      <button type="button" class="btn btn-cancel" onclick="closeReturnModal()" style="padding:6px 10px;">✕</button>
+    </div>
+
+    <form method="post" id="returnForm" style="display:flex;flex-direction:column;min-height:0;flex:1;">
       <input type="hidden" name="form_type" value="return_inspection">
       <input type="hidden" name="rental_id" id="returnRentalId">
       <input type="hidden" name="vehicle_type" id="returnVehicleType">
@@ -2834,125 +3294,132 @@ a{text-decoration:none;color:inherit}
       <input type="hidden" id="returnBaseAmount" value="0">
       <input type="hidden" id="returnDailyRate" value="0">
       <input type="hidden" id="returnExpectedEnd" value="">
-      
-      <div class="pay-card" style="margin:12px 0;">
-        <div class="k" style="margin-bottom:8px;">Summary</div>
-        <div class="pay-grid" style="margin:0;">
-          <div class="pay-card"><div class="k">Start Odometer</div><div class="v" id="sumStartOdo">—</div></div>
-          <div class="pay-card"><div class="k">Return Odometer</div><div class="v" id="sumReturnOdo">—</div></div>
-          <div class="pay-card"><div class="k">Estimated Distance</div><div class="v" id="sumDistance">—</div></div>
-          <div class="pay-card"><div class="k">Late Fee</div><div class="v" id="sumLateFee">₱0.00</div></div>
-          <div class="pay-card"><div class="k">Washing Fee</div><div class="v" id="sumWashFee">₱0.00</div></div>
-          <div class="pay-card"><div class="k">Damage Fee</div><div class="v" id="sumDamageFee">₱0.00</div></div>
-          <div class="pay-card"><div class="k">Final Total</div><div class="v" id="sumFinalTotal">₱0.00</div></div>
-          <div class="pay-card"><div class="k">Paid</div><div class="v" id="sumPaid">₱0.00</div></div>
-          <div class="pay-card"><div class="k">Remaining Balance</div><div class="v" id="sumRemaining">₱0.00</div></div>
-        </div>
-        <div class="pay-help" id="returnSummaryHint" style="margin-top:10px;">This is an estimate for review only.</div>
-      </div>
 
-      <div class="form-row">
-        <div class="form-group">
-          <label>Return Date</label>
-          <input type="date" name="actual_return_date" id="actualReturnDate" value="<?= date('Y-m-d') ?>" required>
-        </div>
-        <div class="form-group">
-          <label>Return Time</label>
-          <input type="time" name="actual_return_time" id="actualReturnTime" value="12:00" min="00:00" max="23:59" required>
-        </div>
-      </div>
-
-      <div class="form-row">
-        <div class="form-group">
-          <label>Return Odometer (km)</label>
-          <input type="number" name="odometer_return" id="odometerReturn" required placeholder="Enter return odometer reading">
-        </div>
-        <div class="form-group">
-          <label>Fuel Level</label>
-          <select name="fuel_level" id="fuelLevel" required onchange="calculateFuelCharge()">
-            <option value="full" selected>Full</option>
-            <option value="3/4">3/4 Tank</option>
-            <option value="half">Half Tank</option>
-            <option value="1/4">1/4 Tank</option>
-            <option value="empty">Empty</option>
-          </select>
-          <div id="fuelChargeDisplay" style="margin-top: 8px; padding: 8px; background: rgba(93, 208, 255, 0.1); border-radius: 6px; border-left: 3px solid var(--brand); display: none;">
-            <span style="color: var(--brand); font-weight: 600;">Fuel Charge: ₱<span id="fuelChargeAmount">0.00</span></span>
+      <div class="return-modal__body">
+        <div class="rm-section">
+          <div class="rm-section__title">1 · Return details</div>
+          <div class="rm-meter">
+            <span>Start odo: <strong id="sumStartOdo">—</strong></span>
+            <span>·</span>
+            <span>Distance: <strong id="sumDistance">—</strong></span>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>Return Date</label>
+              <input type="date" name="actual_return_date" id="actualReturnDate" value="<?= date('Y-m-d') ?>" required>
+            </div>
+            <div class="form-group">
+              <label>Return Time</label>
+              <input type="time" name="actual_return_time" id="actualReturnTime" value="12:00" min="00:00" max="23:59" required>
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>Return Odometer (km)</label>
+              <input type="number" name="odometer_return" id="odometerReturn" required placeholder="Current odometer reading">
+            </div>
+            <div class="form-group">
+              <label>Fuel Level</label>
+              <select name="fuel_level" id="fuelLevel" required onchange="calculateFuelCharge()">
+                <option value="full" selected>Full</option>
+                <option value="3/4">3/4 Tank</option>
+                <option value="half">Half Tank</option>
+                <option value="1/4">1/4 Tank</option>
+                <option value="empty">Empty</option>
+              </select>
+              <div id="fuelChargeDisplay">
+                <span style="color:#5dd0ff;font-weight:700;">Fuel Charge: ₱<span id="fuelChargeAmount">0.00</span></span>
+              </div>
+            </div>
           </div>
         </div>
+
+        <div class="rm-section">
+          <div class="rm-section__title">2 · Condition & cleaning</div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>Vehicle Condition</label>
+              <select name="return_condition" required>
+                <option value="Excellent">Excellent</option>
+                <option value="Good" selected>Good</option>
+                <option value="Fair">Fair</option>
+                <option value="Poor">Poor</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Cleanliness</label>
+              <select name="cleanliness" id="cleanliness" required>
+                <option value="clean" selected>Clean</option>
+                <option value="dirty">Dirty</option>
+                <option value="very_dirty">Very Dirty</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>Washing Type</label>
+              <select name="washing_type" id="washingType" onchange="updateWashCost()">
+                <option value="">No wash / select type…</option>
+              </select>
+              <label class="rm-check">
+                <input type="checkbox" id="veryDirtyCheck" onchange="autoSelectWashing()">
+                Auto-select highest wash rate (very dirty)
+              </label>
+              <div id="washSummary"></div>
+            </div>
+            <div class="form-group">
+              <label>Washing Cost (₱)</label>
+              <input type="number" name="washing_cost" id="washingCost" value="0" step="0.01" min="0" placeholder="0.00">
+            </div>
+          </div>
+        </div>
+
+        <div class="rm-section">
+          <div class="rm-section__title">3 · Notes & damage</div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>Issues or Damage</label>
+              <textarea name="damage_report" id="damageReport" rows="2" placeholder="Optional — describe damage found"></textarea>
+            </div>
+            <div class="form-group">
+              <label>Additional Notes</label>
+              <textarea name="additional_notes" id="additionalNotes" rows="2" placeholder="Optional observations"></textarea>
+            </div>
+          </div>
+          <div class="form-group" style="max-width:240px;">
+            <label>Damage Fee (₱)</label>
+            <input type="number" step="0.01" name="damage_fee" id="damageFee" value="0" min="0" placeholder="0.00">
+          </div>
+        </div>
+
+        <div class="rm-section">
+          <div class="rm-section__title">Charges preview</div>
+          <div class="rm-charges">
+            <div class="rm-charge"><div class="k">Return Odo</div><div class="v" id="sumReturnOdo">—</div></div>
+            <div class="rm-charge warn"><div class="k">Late Fee</div><div class="v" id="sumLateFee">₱0.00</div></div>
+            <div class="rm-charge"><div class="k">Washing</div><div class="v" id="sumWashFee">₱0.00</div></div>
+            <div class="rm-charge"><div class="k">Damage</div><div class="v" id="sumDamageFee">₱0.00</div></div>
+            <div class="rm-charge"><div class="k">Paid</div><div class="v" id="sumPaid">₱0.00</div></div>
+            <div class="rm-charge accent"><div class="k">Final Total</div><div class="v" id="sumFinalTotal">₱0.00</div></div>
+          </div>
+          <div class="rm-totals">
+            <div class="rm-charge accent" style="grid-column:1/-1;">
+              <div class="k">Remaining Balance</div>
+              <div class="v" id="sumRemaining">₱0.00</div>
+            </div>
+          </div>
+          <div class="rm-hint" id="returnSummaryHint">Estimate updates as you fill the form. Confirm to finalize the return.</div>
+        </div>
       </div>
 
-      <div class="form-row">
-        <div class="form-group">
-          <label>Vehicle Condition</label>
-          <select name="return_condition" required>
-            <option value="Excellent">Excellent</option>
-            <option value="Good" selected>Good</option>
-            <option value="Fair">Fair</option>
-            <option value="Poor">Poor</option>
-          </select>
+      <div class="return-modal__foot">
+        <div class="actions">
+          <button type="button" class="btn btn-cancel" onclick="closeReturnModal()">Cancel</button>
+          <button type="submit" class="btn btn-approve" id="submitReturnBtn">
+            <span id="submitText">Complete Return</span>
+            <span id="submitSpinner" style="display: none;">Processing…</span>
+          </button>
         </div>
-        <div class="form-group">
-          <label>Cleanliness</label>
-          <select name="cleanliness" id="cleanliness" required>
-            <option value="clean" selected>Clean</option>
-            <option value="dirty">Dirty</option>
-            <option value="very_dirty">Very Dirty</option>
-          </select>
-        </div>
-      </div>
-
-      <div class="form-row">
-        <div class="form-group">
-          <label>Washing Type</label>
-          <select name="washing_type" id="washingType" onchange="updateWashCost()">
-            <option value="">Select washing type...</option>
-          </select>
-        </div>
-        <div class="form-group">
-          <label>Washing Cost</label>
-          <input type="number" name="washing_cost" id="washingCost" value="0" step="0.01" min="0" readonly style="background-color: #2a2a2a; color: #5dd0ff; font-weight: 600;">
-        </div>
-      </div>
-
-      <div class="form-row">
-        <div class="form-group">
-          <label>
-            <input type="checkbox" id="veryDirtyCheck" onchange="autoSelectWashing()"> 
-            Very Dirty - Auto-select highest washing rate
-          </label>
-        </div>
-        <div class="form-group">
-          <div id="washSummary" style="color: #5dd0ff; font-weight: 600; margin-top: 8px;"></div>
-        </div>
-      </div>
-
-      <div class="form-group">
-        <label>Issues or Damage</label>
-        <textarea name="damage_report" id="damageReport" rows="2" placeholder="Describe any damage or issues found (optional)"></textarea>
-      </div>
-
-      <div class="form-group">
-        <label>Additional Notes</label>
-        <textarea name="additional_notes" id="additionalNotes" rows="2" placeholder="Any additional notes or observations (optional)"></textarea>
-      </div>
-
-      <div class="form-row">
-        <div class="form-group">
-          <label>Damage Fee (₱)</label>
-          <input type="number" step="0.01" name="damage_fee" id="damageFee" value="0" min="0" placeholder="0.00">
-        </div>
-        <div class="form-group">
-          <!-- Empty div for layout balance -->
-        </div>
-      </div>
-
-      <div class="actions">
-        <button type="submit" class="btn btn-approve" id="submitReturnBtn">
-          <span id="submitText">Complete Return</span>
-          <span id="submitSpinner" style="display: none;">⏳ Processing...</span>
-        </button>
-        <button type="button" class="btn btn-cancel" onclick="closeReturnModal()">Cancel</button>
       </div>
     </form>
   </div>
@@ -3190,6 +3657,7 @@ function money(n){
 /* Record Payment modal */
 const paymentModal = document.getElementById('paymentModal');
 function openPaymentModal(rentalId, requiredDown = 0, paidAmount = 0){
+  closeRentalView();
   if(!paymentModal) return;
   paymentModal.style.display = 'flex';
   document.getElementById('paymentRentalId').value = String(rentalId || '');
@@ -3220,6 +3688,139 @@ function closePaymentModal(){
   paymentModal.style.display = 'none';
 }
 window.addEventListener('click', e => { if(e.target === paymentModal) closePaymentModal(); });
+
+/* Review customer receipt */
+const reviewPaymentModal = document.getElementById('reviewPaymentModal');
+function moneyFmt(n){
+  return '₱' + Number(n || 0).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+}
+function openReviewPaymentModal(btn){
+  closeRentalView();
+  if(!reviewPaymentModal || !btn) return;
+  let data = {};
+  try { data = JSON.parse(btn.getAttribute('data-payment') || '{}'); } catch(e){ data = {}; }
+  document.getElementById('reviewPaymentId').value = String(data.payment_id || '');
+  document.getElementById('reviewCustomer').textContent = data.customer || 'Customer';
+  document.getElementById('reviewVehicle').textContent = data.vehicle || 'Vehicle';
+  document.getElementById('reviewAmount').textContent = moneyFmt(data.amount);
+  document.getElementById('reviewMethod').textContent = data.method || '—';
+  document.getElementById('reviewReference').textContent = data.reference_no || '—';
+  document.getElementById('reviewPaidAt').textContent = data.paid_at || '—';
+  const notesEl = document.getElementById('reviewNotes');
+  notesEl.textContent = data.notes ? ('Notes: ' + data.notes) : '';
+  const img = document.getElementById('reviewProofImg');
+  img.src = data.proof_image || '';
+  img.style.display = data.proof_image ? 'inline-block' : 'none';
+  document.getElementById('reviewApproveBtn').disabled = false;
+  document.getElementById('reviewRejectBtn').disabled = false;
+  reviewPaymentModal.style.display = 'flex';
+  document.body.style.overflow = 'hidden';
+}
+function closeReviewPaymentModal(){
+  if(!reviewPaymentModal) return;
+  reviewPaymentModal.style.display = 'none';
+  document.body.style.overflow = '';
+  document.getElementById('reviewProofImg').removeAttribute('src');
+}
+window.addEventListener('click', e => { if(e.target === reviewPaymentModal) closeReviewPaymentModal(); });
+
+async function submitReviewPayment(action){
+  const paymentId = document.getElementById('reviewPaymentId').value;
+  if(!paymentId) return;
+  const approveBtn = document.getElementById('reviewApproveBtn');
+  const rejectBtn = document.getElementById('reviewRejectBtn');
+  approveBtn.disabled = true;
+  rejectBtn.disabled = true;
+  try {
+    const fd = new FormData();
+    fd.append('payment_id', paymentId);
+    fd.append('action', action);
+    const res = await fetch('includes/ajax_verify_payment.php', {
+      method: 'POST',
+      credentials: 'same-origin',
+      body: fd
+    });
+    const data = await res.json();
+    if(!data.success){
+      showToast(data.message || 'Failed to review payment', false);
+      approveBtn.disabled = false;
+      rejectBtn.disabled = false;
+      return;
+    }
+    showToast(data.message || 'Payment reviewed', true);
+    closeReviewPaymentModal();
+    setTimeout(() => window.location.reload(), 800);
+  } catch (err) {
+    showToast('Network error while reviewing payment', false);
+    approveBtn.disabled = false;
+    rejectBtn.disabled = false;
+  }
+}
+window.openReviewPaymentModal = openReviewPaymentModal;
+window.closeReviewPaymentModal = closeReviewPaymentModal;
+window.submitReviewPayment = submitReviewPayment;
+
+/* Review extension request */
+const reviewExtensionModal = document.getElementById('reviewExtensionModal');
+function openReviewExtensionModal(btn){
+  closeRentalView();
+  if(!reviewExtensionModal || !btn) return;
+  let data = {};
+  try { data = JSON.parse(btn.getAttribute('data-extension') || '{}'); } catch(e){ data = {}; }
+  document.getElementById('extReviewRequestId').value = String(data.request_id || '');
+  document.getElementById('extReviewCustomer').textContent = data.customer || 'Customer';
+  document.getElementById('extReviewVehicle').textContent = data.vehicle || 'Vehicle';
+  document.getElementById('extReviewOldEnd').textContent = data.old_end_date || '—';
+  document.getElementById('extReviewNewEnd').textContent = data.requested_end_date || '—';
+  document.getElementById('extReviewCreated').textContent = data.created_at || '—';
+  document.getElementById('extReviewRentalId').textContent = data.rental_id ? ('#' + data.rental_id) : '—';
+  document.getElementById('extApproveBtn').disabled = false;
+  document.getElementById('extRejectBtn').disabled = false;
+  reviewExtensionModal.style.display = 'flex';
+  document.body.style.overflow = 'hidden';
+}
+function closeReviewExtensionModal(){
+  if(!reviewExtensionModal) return;
+  reviewExtensionModal.style.display = 'none';
+  document.body.style.overflow = '';
+}
+window.addEventListener('click', e => { if(e.target === reviewExtensionModal) closeReviewExtensionModal(); });
+
+async function submitReviewExtension(action){
+  const requestId = document.getElementById('extReviewRequestId').value;
+  if(!requestId) return;
+  const approveBtn = document.getElementById('extApproveBtn');
+  const rejectBtn = document.getElementById('extRejectBtn');
+  approveBtn.disabled = true;
+  rejectBtn.disabled = true;
+  try {
+    const fd = new FormData();
+    fd.append('request_id', requestId);
+    fd.append('action', action);
+    const res = await fetch('includes/ajax_verify_extension.php', {
+      method: 'POST',
+      credentials: 'same-origin',
+      body: fd
+    });
+    const data = await res.json();
+    if(!data.success){
+      showToast(data.message || 'Failed to review extension', false);
+      approveBtn.disabled = false;
+      rejectBtn.disabled = false;
+      return;
+    }
+    showToast(data.message || 'Extension reviewed', true);
+    closeReviewExtensionModal();
+    setTimeout(() => window.location.reload(), 800);
+  } catch (err) {
+    showToast('Network error while reviewing extension', false);
+    approveBtn.disabled = false;
+    rejectBtn.disabled = false;
+  }
+}
+window.openReviewExtensionModal = openReviewExtensionModal;
+window.closeReviewExtensionModal = closeReviewExtensionModal;
+window.submitReviewExtension = submitReviewExtension;
 
 function parseMoneyInput(v){
   const s = String(v || '').replace(/[^0-9.]/g,'');
@@ -3299,8 +3900,19 @@ function parseRowRental(row){
   try { return JSON.parse(raw); } catch(e) { return {}; }
 }
 
+const RENTALS_PER_PAGE = 8;
+let rentalsPage = 1;
+
+function getRentalRows(){
+  return Array.from(document.querySelectorAll('#rows .rental-row'));
+}
+
+function getFilteredRentalRows(){
+  return getRentalRows().filter(row => row.dataset.filtered !== '0');
+}
+
 function updateSummary(){
-  const rows = Array.from(document.querySelectorAll('.row')).filter(r => r.style.display !== 'none');
+  const rows = getFilteredRentalRows();
   let shown = 0;
   let totalValue = 0;
   let totalBalance = 0;
@@ -3328,49 +3940,225 @@ function updateSummary(){
   if(overdueEl) overdueEl.textContent = String(overdue);
 }
 
-function openRentalDrawer(btn){
+function renderRentalsPage(){
+  const matched = getFilteredRentalRows();
+  const total = matched.length;
+  const totalPages = Math.max(1, Math.ceil(total / RENTALS_PER_PAGE) || 1);
+  if (rentalsPage > totalPages) rentalsPage = totalPages;
+  if (rentalsPage < 1) rentalsPage = 1;
+
+  const start = (rentalsPage - 1) * RENTALS_PER_PAGE;
+  const end = start + RENTALS_PER_PAGE;
+
+  getRentalRows().forEach(row => {
+    if (row.dataset.filtered === '0') {
+      row.style.display = 'none';
+      return;
+    }
+    const idx = matched.indexOf(row);
+    row.style.display = (idx >= start && idx < end) ? '' : 'none';
+  });
+
+  renderRentalsPagination(total, totalPages);
+}
+
+function renderRentalsPagination(total, totalPages){
+  const nav = document.getElementById('rentalsPagination');
+  const info = document.getElementById('rentalsPaginationInfo');
+  if (!nav || !info) return;
+
+  if (total === 0 || totalPages <= 1) {
+    nav.hidden = true;
+    info.hidden = true;
+    nav.innerHTML = '';
+    info.textContent = '';
+    return;
+  }
+
+  nav.hidden = false;
+  info.hidden = false;
+
+  let html = '';
+  if (rentalsPage > 1) {
+    html += `<button type="button" data-page="${rentalsPage - 1}" aria-label="Previous page">‹</button>`;
+  } else {
+    html += `<span class="disabled" aria-disabled="true">‹</span>`;
+  }
+
+  const windowSize = 2;
+  let startPage = Math.max(1, rentalsPage - windowSize);
+  let endPage = Math.min(totalPages, rentalsPage + windowSize);
+
+  if (startPage > 1) {
+    html += `<button type="button" data-page="1">1</button>`;
+    if (startPage > 2) html += `<span class="disabled">…</span>`;
+  }
+  for (let p = startPage; p <= endPage; p++) {
+    if (p === rentalsPage) {
+      html += `<span class="active" aria-current="page">${p}</span>`;
+    } else {
+      html += `<button type="button" data-page="${p}">${p}</button>`;
+    }
+  }
+  if (endPage < totalPages) {
+    if (endPage < totalPages - 1) html += `<span class="disabled">…</span>`;
+    html += `<button type="button" data-page="${totalPages}">${totalPages}</button>`;
+  }
+
+  if (rentalsPage < totalPages) {
+    html += `<button type="button" data-page="${rentalsPage + 1}" aria-label="Next page">›</button>`;
+  } else {
+    html += `<span class="disabled" aria-disabled="true">›</span>`;
+  }
+
+  nav.innerHTML = html;
+  const from = total === 0 ? 0 : ((rentalsPage - 1) * RENTALS_PER_PAGE) + 1;
+  const to = Math.min(rentalsPage * RENTALS_PER_PAGE, total);
+  info.textContent = `Page ${rentalsPage} of ${totalPages} · showing ${from}–${to} of ${total}`;
+}
+
+function goToRentalsPage(page){
+  rentalsPage = page;
+  renderRentalsPage();
+  const list = document.getElementById('rows');
+  if (list) list.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function openRentalView(btn){
   const row = btn?.closest('.row');
   if(!row) return;
-  const raw = row.getAttribute('data-rental') || '{}';
-  let r = {};
-  try { r = JSON.parse(raw); } catch(e) { r = {}; }
+  const r = parseRowRental(row);
+  const status = (r.status || '').toString().toLowerCase();
+  const statusLabel = status ? status.charAt(0).toUpperCase() + status.slice(1) : '—';
 
-  document.getElementById('drawerTitle').textContent = `Rental #${r.id || ''}`;
-  document.getElementById('drawerSub').textContent = `${r.customer || ''} • ${r.vehicle || ''} (${r.plate || ''})`;
+  document.getElementById('viewTitle').textContent = `Rental #${r.id || ''}`;
+  document.getElementById('viewSub').textContent = `${r.customer || '—'} · ${r.vehicle || '—'} (${r.plate || '—'})`;
 
-  const body = document.getElementById('drawerBody');
-  body.innerHTML = `
-    <div class="kv"><div class="k">Status</div><div class="v">${(r.status || '').toString().toUpperCase()}</div></div>
-    <div class="kv"><div class="k">Schedule</div><div class="v">${r.start_date || ''} → ${r.end_date || ''}</div></div>
-    <div class="kv"><div class="k">Days</div><div class="v">${r.days || 0}</div></div>
-    <div class="kv"><div class="k">Daily Rate</div><div class="v">${money(r.daily_rate)}</div></div>
-    <div class="kv"><div class="k">Total</div><div class="v">${money(r.total)}</div></div>
-    <div class="kv"><div class="k">Required Down</div><div class="v">${money(r.downpayment)}</div></div>
-    <div class="kv"><div class="k">Paid</div><div class="v">${money(r.paid_amount)}</div></div>
-    <div class="kv"><div class="k">Balance</div><div class="v">${money(r.balance_due)}</div></div>
-    <div class="kv"><div class="k">Vehicle Type</div><div class="v">${r.vehicle_type || '—'}</div></div>
+  const badges = [];
+  badges.push(`<span class="status s-${status}">${statusLabel}</span>`);
+  const due = row.querySelector('.due-pill');
+  if (due) badges.push(due.outerHTML);
+
+  const source = row.querySelector('.rental-actions-source');
+  const sourceBadges = source ? Array.from(source.querySelectorAll('.pay-badge')).map(el => el.outerHTML).join('') : '';
+
+  const receipts = Array.isArray(r.receipts) ? r.receipts : [];
+  let receiptHtml = '';
+  if (receipts.length) {
+    receiptHtml = `<div class="view-receipts">${receipts.map((p) => {
+      const img = escHtml(p.proof_image || '');
+      const amt = money(p.amount);
+      const method = escHtml(p.method || '—');
+      const st = escHtml(String(p.status || '—').toUpperCase());
+      const paidAt = escHtml(p.paid_at || '—');
+      const ref = escHtml(p.reference_no || '');
+      const ptype = escHtml(p.payment_type || 'Payment');
+      return `
+        <div class="view-receipt-card">
+          <div class="view-receipt-meta">
+            <span><strong>${ptype}</strong></span>
+            <span>${amt}</span>
+            <span>${method}</span>
+            <span>${st}</span>
+            <span>${paidAt}</span>
+            ${ref ? `<span>Ref: ${ref}</span>` : ''}
+          </div>
+          <a href="${img}" target="_blank" rel="noopener" title="Open receipt">
+            <img class="view-receipt-img" src="${img}" alt="Payment receipt"
+              onerror="this.style.display='none'; this.parentNode.insertAdjacentHTML('beforeend','<div class=\\'view-receipt-empty\\'>Could not load receipt image.</div>');">
+          </a>
+        </div>`;
+    }).join('')}</div>`;
+  } else {
+    receiptHtml = `<div class="view-receipt-empty">No customer receipt uploaded for this rental.</div>`;
+  }
+
+  document.getElementById('viewBody').innerHTML = `
+    <div class="view-section">
+      <div class="view-section-title">Overview</div>
+      <div class="view-badges">${badges.join('')}${sourceBadges}</div>
+    </div>
+    <div class="view-section">
+      <div class="view-section-title">Schedule</div>
+      <div class="view-grid">
+        <div class="view-card"><div class="k">Start</div><div class="v">${r.start_date || '—'}</div></div>
+        <div class="view-card"><div class="k">End</div><div class="v">${r.end_date || '—'}${r.end_time ? ' · ' + r.end_time : ''}</div></div>
+        <div class="view-card"><div class="k">Duration</div><div class="v">${r.days || 0} day${Number(r.days) === 1 ? '' : 's'}</div></div>
+        <div class="view-card"><div class="k">Vehicle Type</div><div class="v">${r.vehicle_type || '—'}</div></div>
+      </div>
+    </div>
+    <div class="view-section">
+      <div class="view-section-title">Payment</div>
+      <div class="view-grid">
+        <div class="view-card"><div class="k">Total</div><div class="v em">${money(r.total)}</div></div>
+        <div class="view-card"><div class="k">Daily Rate</div><div class="v">${money(r.daily_rate)}</div></div>
+        <div class="view-card"><div class="k">Required Down</div><div class="v">${money(r.downpayment)}</div></div>
+        <div class="view-card"><div class="k">Paid</div><div class="v">${money(r.paid_amount)}</div></div>
+        <div class="view-card"><div class="k">Balance</div><div class="v em">${money(r.balance_due)}</div></div>
+        <div class="view-card"><div class="k">Plate</div><div class="v">${r.plate || '—'}</div></div>
+      </div>
+    </div>
+    <div class="view-section">
+      <div class="view-section-title">Customer Receipt</div>
+      ${receiptHtml}
+    </div>
+    ${String(r.status || '').toLowerCase() === 'cancelled' && r.cancel_reason ? `
+    <div class="view-section">
+      <div class="view-section-title">Cancellation</div>
+      <div class="view-receipt-empty" style="text-align:left">
+        ${r.cancelled_at ? `<div style="margin-bottom:8px;color:var(--muted);font-size:.8rem">Cancelled at ${escHtml(r.cancelled_at)}</div>` : ''}
+        <div style="color:var(--text);font-weight:700;line-height:1.45">${escHtml(r.cancel_reason)}</div>
+      </div>
+    </div>` : ''}
   `;
 
-  const actions = document.getElementById('drawerActions');
+  const actions = document.getElementById('viewActions');
   actions.innerHTML = '';
+
+  if (source) {
+    const stack = source.querySelector('.actions-stack');
+    if (stack) {
+      const clone = stack.cloneNode(true);
+      clone.querySelectorAll('[onclick*="openExtendModalFromRow"]').forEach(el => {
+        el.setAttribute('data-from-view', '1');
+      });
+      actions.appendChild(clone);
+    }
+  }
+
   const closeBtn = document.createElement('button');
   closeBtn.className = 'btn btn-secondary';
   closeBtn.type = 'button';
   closeBtn.textContent = 'Close';
-  closeBtn.onclick = closeRentalDrawer;
+  closeBtn.onclick = closeRentalView;
   actions.appendChild(closeBtn);
 
-  document.getElementById('rentalDrawerBg').classList.add('open');
-  document.getElementById('rentalDrawer').classList.add('open');
+  document.getElementById('rentalViewModal').dataset.sourceRowId = String(r.id || '');
+  window.__activeRentalRow = row;
+
+  document.getElementById('rentalViewBg').classList.add('open');
+  document.body.style.overflow = 'hidden';
 }
 
-function closeRentalDrawer(){
-  document.getElementById('rentalDrawerBg')?.classList.remove('open');
-  document.getElementById('rentalDrawer')?.classList.remove('open');
+function escHtml(v){
+  return String(v ?? '')
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;');
 }
+
+function closeRentalView(){
+  document.getElementById('rentalViewBg')?.classList.remove('open');
+  document.body.style.overflow = '';
+  window.__activeRentalRow = null;
+}
+
+function openRentalDrawer(btn){ openRentalView(btn); }
+function closeRentalDrawer(){ closeRentalView(); }
 
 document.addEventListener('keydown', function(e){
-  if(e.key === 'Escape') closeRentalDrawer();
+  if(e.key === 'Escape') closeRentalView();
 });
 
 function filterByStatus(status) {
@@ -3384,9 +4172,7 @@ function applyFilters() {
   const startDateFilter = document.getElementById('startDateFilter').value;
   const endDateFilter = document.getElementById('endDateFilter').value;
   
-  const rows = document.querySelectorAll('.row');
-  
-  rows.forEach(row => {
+  getRentalRows().forEach(row => {
     const customer = row.querySelector('[data-label="Customer"]')?.textContent.toLowerCase() || '';
     const vehicle = row.querySelector('[data-label="Vehicle"]')?.textContent.toLowerCase() || '';
     const status = row.querySelector('.status')?.textContent.toLowerCase() || '';
@@ -3398,9 +4184,11 @@ function applyFilters() {
     const matchesStartDate = !startDateFilter || startDate >= startDateFilter;
     const matchesEndDate = !endDateFilter || endDate <= endDateFilter;
     
-    row.style.display = (matchesSearch && matchesStatus && matchesStartDate && matchesEndDate) ? '' : 'none';
+    row.dataset.filtered = (matchesSearch && matchesStatus && matchesStartDate && matchesEndDate) ? '1' : '0';
   });
 
+  rentalsPage = 1;
+  renderRentalsPage();
   updateSummary();
 }
 
@@ -3410,14 +4198,14 @@ function resetFilters() {
   document.getElementById('startDateFilter').value = '';
   document.getElementById('endDateFilter').value = '';
   
-  // Show all rows
-  document.querySelectorAll('.row').forEach(row => row.style.display = '');
-
+  getRentalRows().forEach(row => { row.dataset.filtered = '1'; });
+  rentalsPage = 1;
+  renderRentalsPage();
   updateSummary();
 }
 
 function exportRentals() {
-  const visibleRows = Array.from(document.querySelectorAll('.row')).filter(row => row.style.display !== 'none');
+  const visibleRows = getFilteredRentalRows();
   const csvData = [];
   
   // Add header
@@ -3425,20 +4213,20 @@ function exportRentals() {
   
   // Add data rows
   visibleRows.forEach(row => {
-    const customer = row.querySelector('[data-label="Customer"]')?.textContent || '';
-    const vehicle = row.querySelector('[data-label="Vehicle"]')?.textContent || '';
-    const plate = (row.querySelector('[data-label="Vehicle"]')?.textContent.match(/Plate:\s*([^\n\r]+)/i)?.[1] || '').trim();
-    const startDate = row.getAttribute('data-start-date') || '';
-    const endDate = row.getAttribute('data-end-date') || '';
-    const costText = row.querySelector('[data-label="Cost"]')?.textContent || '';
-    const rate = (costText.match(/Rate:\s*₱?([0-9,\.]+)/i)?.[1] || '').trim();
-    const total = (costText.match(/₱\s*([0-9,\.]+)/)?.[1] || '').trim();
-    const requiredDown = (costText.match(/Required\s*Down:\s*₱?([0-9,\.]+)/i)?.[1] || '').trim();
-    const paid = (costText.match(/Paid:\s*₱?([0-9,\.]+)/i)?.[1] || '').trim();
-    const bal = (costText.match(/Balance:\s*₱?([0-9,\.]+)/i)?.[1] || '').trim();
-    const status = row.querySelector('.status')?.textContent || '';
-    
-    csvData.push([customer, vehicle, plate, startDate, endDate, rate, total, requiredDown, paid, bal, status]);
+    const r = parseRowRental(row);
+    csvData.push([
+      r.customer || '',
+      r.vehicle || '',
+      r.plate || '',
+      r.start_date || '',
+      r.end_date || '',
+      Number(r.daily_rate || 0).toFixed(2),
+      Number(r.total || 0).toFixed(2),
+      Number(r.downpayment || 0).toFixed(2),
+      Number(r.paid_amount || 0).toFixed(2),
+      Number(r.balance_due || 0).toFixed(2),
+      r.status || ''
+    ]);
   });
   
   // Convert to CSV and download
@@ -3462,16 +4250,32 @@ document.addEventListener('DOMContentLoaded', function() {
   document.getElementById('startDateFilter').addEventListener('change', applyFilters);
   document.getElementById('endDateFilter').addEventListener('change', applyFilters);
 
-  updateSummary();
+  const pagination = document.getElementById('rentalsPagination');
+  if (pagination) {
+    pagination.addEventListener('click', function(e) {
+      const btn = e.target.closest('[data-page]');
+      if (!btn) return;
+      const page = parseInt(btn.getAttribute('data-page'), 10);
+      if (!Number.isFinite(page) || page < 1) return;
+      goToRentalsPage(page);
+    });
+  }
+
+  applyFilters();
 });
 
 /* Extend modal */
 const modal=document.getElementById('extendModal');
 // Open extend modal with data from the database
 function openExtendModalFromRow(btn) {
-  const row = btn.closest('.row');
-  const rowData = JSON.parse(row.dataset.rental);
+  const row = btn.closest('.row') || window.__activeRentalRow;
+  if (!row) {
+    showToast('Unable to find rental row', false);
+    return;
+  }
+  const rowData = JSON.parse(row.dataset.rental || '{}');
   const rentalId = rowData.id;
+  closeRentalView();
 
   // Show loading state
   showToast('Loading rental details...', true);
@@ -3767,6 +4571,7 @@ window.addEventListener('click',e=>{ if(e.target===modal) closeModal(); });
 /* Return modal */
 const returnModal=document.getElementById('returnModal');
 function openReturnModal(rentalId, vehicleModel, plateNo, expectedEndDate, expectedEndTime, vehicleId = null, vehicleType = null){
+  closeRentalView();
   console.log('Opening return modal for rental:', rentalId, 'vehicle:', vehicleId, 'type:', vehicleType);
   returnModal.style.display='flex';
   document.getElementById('returnRentalId').value = rentalId;
@@ -4045,7 +4850,9 @@ async function loadWashingTypesForReturn(vehicleType) {
         } else {
           option.textContent = `${wash.washing_name} — ₱${wash.washing_rate}`;
         }
-        option.dataset.rate = wash.washing_rate;
+        const rate = parseFloat(wash.washing_rate) || 0;
+        option.dataset.rate = rate;
+        option.dataset.cost = rate;
         washSelect.appendChild(option);
       });
       console.log(`Successfully loaded ${data.washing_types.length} washing types for ${vehicleType}`);
@@ -4073,33 +4880,42 @@ function updateWashCost() {
   const washSelect = document.getElementById('washingType');
   const washCost = document.getElementById('washingCost');
   const washSummary = document.getElementById('washSummary');
-  
+  if (!washSelect || !washCost) return;
+
   const selectedOption = washSelect.selectedOptions[0];
-  const cost = selectedOption ? parseFloat(selectedOption.dataset.cost) || 0 : 0;
-  
-  washCost.value = cost;
-  washSummary.innerHTML = cost > 0 ? `Total Wash Cost: ₱${cost.toFixed(2)}` : '';
+  const cost = selectedOption
+    ? (parseFloat(selectedOption.dataset.cost || selectedOption.dataset.rate) || 0)
+    : 0;
+
+  washCost.value = cost.toFixed(2);
+  if (washSummary) {
+    washSummary.innerHTML = cost > 0 ? `Total Wash Cost: ₱${cost.toFixed(2)}` : '';
+  }
+  if (typeof updateReturnPreview === 'function') {
+    try { updateReturnPreview(); } catch (e) {}
+  }
 }
 
 function autoSelectWashing() {
   const veryDirtyCheck = document.getElementById('veryDirtyCheck');
   const washSelect = document.getElementById('washingType');
-  
+  if (!veryDirtyCheck || !washSelect) return;
+
   if (veryDirtyCheck.checked) {
     // Find the highest cost option
     let highestCost = 0;
     let highestOption = null;
-    
+
     for (let option of washSelect.options) {
-      if (option.value && option.dataset.cost) {
-        const cost = parseFloat(option.dataset.cost);
+      if (option.value && (option.dataset.cost || option.dataset.rate)) {
+        const cost = parseFloat(option.dataset.cost || option.dataset.rate) || 0;
         if (cost > highestCost) {
           highestCost = cost;
           highestOption = option;
         }
       }
     }
-    
+
     if (highestOption) {
       washSelect.value = highestOption.value;
       updateWashCost();
@@ -4233,6 +5049,7 @@ function closeReceiptModal(){
 }
 
 function viewReceipt(rentalId) {
+  closeRentalView();
   console.log('=== ADMIN VIEW RECEIPT CALLED ===');
   console.log('Admin viewReceipt called with rentalId:', rentalId);
   
@@ -4717,9 +5534,6 @@ window.testSimple = function() {
 /* Auto-refresh rentals every 15s and keep Advance countdown */
 async function refreshRentals(){
   try{
-    const r=await fetch('rentals_all.php?ajax=rentals',{cache:'no-store'});
-    const j=await r.json();
-    document.getElementById('rows').innerHTML=j.tbody;
     attachCountdowns();
   }catch(e){}
 }
@@ -4967,6 +5781,8 @@ if(isset($_GET['ajax']) && $_GET['ajax']==='rentals'){
   //   WHERE status='reserved' AND start_date <= CURDATE() AND end_date >= CURDATE()
   // ");
   $rows = fetchRentals($conn);
+  $pendingPaymentsByRental = fetchPendingPaymentsByRental($conn);
+  $pendingExtensionsByRental = fetchPendingExtensionsByRental($conn);
 
   // re-render rows HTML server-side (same layout)
   ob_start();
@@ -5032,8 +5848,14 @@ if(isset($_GET['ajax']) && $_GET['ajax']==='rentals'){
       if($isAdvance) echo ' <span class="future">Advance</span> <span class="countdown" data-start="'.h($r['start_date']).'">—</span>';
       echo '</div>';
 
-      if($st==='pending'){
-        if ($paid_amount <= 0.00001) {
+      if($st==='waitlist'){
+        echo '<div class="pay-badge pay-awaiting">Awaiting Payment</div>';
+      } elseif($st==='pending'){
+        $pendingProofs = $pendingPaymentsByRental[(int)$r['id']] ?? [];
+        $hasPendingProof = !empty($pendingProofs);
+        if ($hasPendingProof) {
+          echo '<div class="pay-badge pay-review">Receipt Under Review</div>';
+        } elseif ($paid_amount <= 0.00001) {
           echo '<div class="pay-badge pay-awaiting">Awaiting Downpayment</div>';
         } elseif ($paid_amount + 0.00001 < $required_down) {
           echo '<div class="pay-badge pay-partial">Partial Downpayment</div>';
@@ -5043,8 +5865,30 @@ if(isset($_GET['ajax']) && $_GET['ajax']==='rentals'){
       }
 
       echo '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">';
-      if($st==='pending'){
+      if($st==='waitlist'){
+        echo '<span class="muted">Waiting for the customer to submit a receipt.</span>';
+        echo '<button class="btn btn-cancel" onclick="rejectRental('.(int)$r['id'].')">Cancel</button>';
+      } elseif($st==='pending'){
         $canApprove = ($paid_amount + 0.00001 >= $required_down);
+        $pendingProofs = $pendingPaymentsByRental[(int)$r['id']] ?? [];
+        if (!empty($pendingProofs)) {
+          $firstProof = $pendingProofs[0];
+          $proofJson = htmlspecialchars(json_encode([
+            'payment_id' => (int)$firstProof['payment_id'],
+            'rental_id' => (int)$r['id'],
+            'customer' => (string)$r['full_name'],
+            'vehicle' => (string)$r['make_model'],
+            'amount' => (float)$firstProof['amount'],
+            'method' => (string)($firstProof['payment_method'] ?? ''),
+            'reference_no' => (string)($firstProof['reference_no'] ?? ''),
+            'notes' => (string)($firstProof['notes'] ?? ''),
+            'proof_image' => (string)($firstProof['proof_image'] ?? ''),
+            'paid_at' => (string)($firstProof['paid_at'] ?? ''),
+            'required_down' => (float)$required_down,
+            'paid_amount' => (float)$paid_amount,
+          ], JSON_UNESCAPED_SLASHES), ENT_QUOTES, 'UTF-8');
+          echo '<button class="btn pay-review-btn" type="button" data-payment="'.$proofJson.'" onclick="openReviewPaymentModal(this)">Review Receipt</button>';
+        }
         echo '<button class="btn btn-secondary" onclick="openPaymentModal('.(int)$r['id'].','.(float)$required_down.','.(float)$paid_amount.')">Record Payment</button>';
         echo '<button class="btn btn-approve" '.($canApprove?'':'disabled title="Downpayment not met"'). ' onclick="approveRental('.(int)$r['id'].')">Approve</button>';
         echo '<button class="btn btn-cancel" onclick="rejectRental('.(int)$r['id'].')">Reject</button>';

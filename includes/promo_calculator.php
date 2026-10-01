@@ -19,12 +19,39 @@ require_once __DIR__ . '/pricing_validator.php';
 function calculatePromotionalRate($customer_id, $vehicle_id, $rental_days, $rate_type, $base_rate) {
     global $conn;
     
-    // Get vehicle information
-    $stmt = $conn->prepare("SELECT vehicle_type FROM vehicles WHERE id = ?");
-    $stmt->bind_param("i", $vehicle_id);
-    $stmt->execute();
-    $vehicle = $stmt->get_result()->fetch_assoc();
+    // Get vehicle information (including optional per-vehicle promo)
+    $vehicle = null;
+    $vehicle_type = '';
+    $vehicle_promo_type = 'none';
+    $vehicle_promo_value = 0.0;
+    $vehicle_promo_starts = null;
+    $vehicle_promo_ends = null;
+    try {
+        $stmt = $conn->prepare("SELECT vehicle_type, promo_discount_type, promo_discount_value, promo_starts_at, promo_ends_at FROM vehicles WHERE id = ?");
+        $stmt->bind_param("i", $vehicle_id);
+        $stmt->execute();
+        $vehicle = $stmt->get_result()->fetch_assoc();
+        $stmt->close();
+    } catch (Throwable $e) {
+        try {
+            $stmt = $conn->prepare("SELECT vehicle_type, promo_discount_type, promo_discount_value FROM vehicles WHERE id = ?");
+            $stmt->bind_param("i", $vehicle_id);
+            $stmt->execute();
+            $vehicle = $stmt->get_result()->fetch_assoc();
+            $stmt->close();
+        } catch (Throwable $e2) {
+            $stmt = $conn->prepare("SELECT vehicle_type FROM vehicles WHERE id = ?");
+            $stmt->bind_param("i", $vehicle_id);
+            $stmt->execute();
+            $vehicle = $stmt->get_result()->fetch_assoc();
+            $stmt->close();
+        }
+    }
     $vehicle_type = $vehicle['vehicle_type'] ?? '';
+    $vehicle_promo_type = strtolower((string)($vehicle['promo_discount_type'] ?? 'none'));
+    $vehicle_promo_value = (float)($vehicle['promo_discount_value'] ?? 0);
+    $vehicle_promo_starts = $vehicle['promo_starts_at'] ?? null;
+    $vehicle_promo_ends = $vehicle['promo_ends_at'] ?? null;
     
     // Get customer classification for business discounts
     // Note: Using users table since customers table doesn't have discount_rate column
@@ -42,19 +69,24 @@ function calculatePromotionalRate($customer_id, $vehicle_id, $rental_days, $rate
     $booking_count = $stmt->get_result()->fetch_assoc()['booking_count'];
     $stmt->close();
     
-    // Find the best applicable promotion
-    $stmt = $conn->prepare("
-        SELECT * FROM promotions 
-        WHERE is_active = 1 
-        AND min_days <= ?
-        AND min_bookings <= ?
-        ORDER BY discount_percent DESC
-        LIMIT 1
-    ");
-    $stmt->bind_param("ii", $rental_days, $booking_count);
-    $stmt->execute();
-    $promo = $stmt->get_result()->fetch_assoc();
-    $stmt->close();
+    // Find the best applicable promotion (table may be missing on older DBs)
+    $promo = null;
+    try {
+        $stmt = $conn->prepare("
+            SELECT * FROM promotions 
+            WHERE is_active = 1 
+            AND min_days <= ?
+            AND min_bookings <= ?
+            ORDER BY discount_percent DESC
+            LIMIT 1
+        ");
+        $stmt->bind_param("ii", $rental_days, $booking_count);
+        $stmt->execute();
+        $promo = $stmt->get_result()->fetch_assoc();
+        $stmt->close();
+    } catch (Throwable $e) {
+        $promo = null;
+    }
     
     // Initialize default values
     $promo_applied = null;
@@ -113,6 +145,43 @@ function calculatePromotionalRate($customer_id, $vehicle_id, $rental_days, $rate
         $promo_discount = 0;
         $discount_percent = 0;
     }
+
+    // Per-vehicle promo from admin Pricing section (percent or fixed ₱/day)
+    // Active with schedule window, or always-on when no window is set.
+    $vehicle_promo_active = false;
+    if ($vehicle_promo_value > 0 && in_array($vehicle_promo_type, ['percent', 'fixed'], true)) {
+        if (!function_exists('vehicle_promo_is_active_now')) {
+            require_once __DIR__ . '/vehicle_promo.php';
+        }
+        $vehicle_promo_active = vehicle_promo_is_active_now(
+            $vehicle_promo_starts ? (string)$vehicle_promo_starts : null,
+            $vehicle_promo_ends ? (string)$vehicle_promo_ends : null
+        );
+    }
+
+    if ($vehicle_promo_active && $rental_days > 0) {
+        $veh_discount_percent = 0.0;
+        $veh_promo_discount = 0.0;
+        $veh_label = 'Vehicle Promo';
+
+        if ($vehicle_promo_type === 'percent') {
+            $veh_discount_percent = min(100.0, max(0.0, $vehicle_promo_value));
+            $veh_promo_discount = ($base_rate * $veh_discount_percent / 100) * $rental_days;
+            $veh_label = 'Vehicle Promo (' . rtrim(rtrim(number_format($veh_discount_percent, 2), '0'), '.') . '%)';
+        } else {
+            // Fixed peso off each day
+            $per_day = min($base_rate, max(0.0, $vehicle_promo_value));
+            $veh_promo_discount = $per_day * $rental_days;
+            $veh_discount_percent = $base_rate > 0 ? ($per_day / $base_rate) * 100 : 0;
+            $veh_label = 'Vehicle Promo (₱' . number_format($per_day, 2) . '/day)';
+        }
+
+        if ($veh_promo_discount > $promo_discount + 0.00001) {
+            $promo_applied = $veh_label;
+            $promo_discount = $veh_promo_discount;
+            $discount_percent = $veh_discount_percent;
+        }
+    }
     
     // Calculate final rate
     $applied_rate = $base_rate - ($base_rate * $discount_percent / 100);
@@ -146,16 +215,24 @@ function calculatePromotionalRate($customer_id, $vehicle_id, $rental_days, $rate
 function getVehicleRate($vehicle_id, $rate_type) {
     global $conn;
     
-    $stmt = $conn->prepare("SELECT daily_rate_cdo, daily_rate_outside_cdo FROM vehicles WHERE id = ?");
+    $stmt = $conn->prepare("SELECT daily_rate, daily_rate_cdo, daily_rate_outside_cdo FROM vehicles WHERE id = ?");
     $stmt->bind_param("i", $vehicle_id);
     $stmt->execute();
     $vehicle = $stmt->get_result()->fetch_assoc();
-    
-    if ($rate_type === 'Outside-CDO') {
-        return (float)($vehicle['daily_rate_outside_cdo'] ?? 0);
-    } else {
-        return (float)($vehicle['daily_rate_cdo'] ?? 0);
+    $stmt->close();
+
+    if (!$vehicle) {
+        return 0.0;
     }
+
+    $fallback = (float)($vehicle['daily_rate'] ?? 0);
+    if ($rate_type === 'Outside-CDO') {
+        $rate = (float)($vehicle['daily_rate_outside_cdo'] ?? 0);
+        return $rate > 0 ? $rate : $fallback;
+    }
+
+    $rate = (float)($vehicle['daily_rate_cdo'] ?? 0);
+    return $rate > 0 ? $rate : $fallback;
 }
 
 /**

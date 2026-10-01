@@ -10,6 +10,7 @@ session_start();
 
 require_once __DIR__ . '/db.php';
 require_once __DIR__ . '/promo_calculator.php';
+ensure_rental_waitlist_status($conn);
 
 /* ==========================
    AUTH CHECK
@@ -179,6 +180,21 @@ $end_date   = trim($_POST['end_date'] ?? '');
 $start_time = trim($_POST['start_time'] ?? '08:00:00'); // User-selected pickup time
 $end_time   = trim($_POST['end_time'] ?? '18:00:00');   // User-selected return time
 $rate_type  = trim($_POST['rate_type'] ?? 'CDO'); // CDO or Outside-CDO
+$accept_terms = isset($_POST['accept_terms']) && $_POST['accept_terms'] === '1';
+$accept_fuel_policy = isset($_POST['accept_fuel_policy']) && $_POST['accept_fuel_policy'] === '1';
+$passenger_count = max(1, (int)($_POST['passenger_count'] ?? 1));
+
+if (!$accept_terms) {
+  header('Content-Type: application/json');
+  echo json_encode(['error' => true, 'message' => '⚠️ Please accept the Terms and Agreement and Privacy Policy to continue.']);
+  exit;
+}
+
+if (!$accept_fuel_policy) {
+  header('Content-Type: application/json');
+  echo json_encode(['error' => true, 'message' => '⚠️ Please confirm that you understand the fuel level must be the same before and after the rent.']);
+  exit;
+}
 
 if (!$vehicle_id || !$start_date || !$end_date || !$start_time || !$end_time) {
   header('Content-Type: application/json');
@@ -206,20 +222,19 @@ if ($end_datetime <= $start_datetime) {
 
 /* ==========================
    CONFLICT CHECK
+   Inclusive date overlap — must match Flatpickr occupied-date disable.
 ========================== */
 $conflict_sql = "
-  SELECT id, status, start_date, start_time, end_date, end_time
+  SELECT id, status, start_date, end_date
   FROM rentals
   WHERE vehicle_id = ?
-    AND status IN ('pending','ongoing','reserved')
-    AND (
-      (start_date < ? OR (start_date = ? AND start_time <= ?)) 
-      AND 
-      (end_date > ? OR (end_date = ? AND end_time >= ?))
-    )
+    AND status IN ('ongoing','reserved')
+    AND start_date <= ?
+    AND end_date >= ?
 ";
 $conflict = $conn->prepare($conflict_sql);
-$conflict->bind_param("isssiss", $vehicle_id, $end_date, $end_date, $end_time, $start_date, $start_date, $start_time);
+// Both dates are strings ("iss" was wrong: the 2nd date was bound as int → false conflicts)
+$conflict->bind_param("iss", $vehicle_id, $end_date, $start_date);
 $conflict->execute();
 $res = $conflict->get_result();
 $conflicts = $res->fetch_all(MYSQLI_ASSOC);
@@ -248,7 +263,7 @@ if (count($conflicts) > 0) {
    MAINTENANCE BLOCKING CHECK
 ========================== */
 $maintenance_check = $conn->prepare("
-  SELECT m.id, m.status, m.schedule_date, m.maintenance_category, m.description
+  SELECT m.id, m.status, m.schedule_date, m.maintenance_category
   FROM maintenance m
   WHERE m.vehicle_id = ?
     AND m.status IN ('reported', 'scheduled', 'approved', 'in_progress')
@@ -281,12 +296,16 @@ if ($maintenance_result) {
 /* ==========================
    GET VEHICLE RATE + INFO
 ========================== */
-$stmt = $conn->prepare("SELECT daily_rate_cdo, daily_rate_outside_cdo, maker, model, make_model FROM vehicles WHERE id = ?");
+$stmt = $conn->prepare("SELECT daily_rate, daily_rate_cdo, daily_rate_outside_cdo, maker, model, make_model, seats FROM vehicles WHERE id = ?");
 $stmt->bind_param("i", $vehicle_id);
 $stmt->execute();
-$stmt->bind_result($rate_cdo, $rate_outside, $maker, $model, $make_model);
+$stmt->bind_result($daily_rate, $rate_cdo, $rate_outside, $maker, $model, $make_model, $vehicle_seats);
 $stmt->fetch();
 $stmt->close();
+
+$rate_cdo = (float)($rate_cdo ?: $daily_rate);
+$rate_outside = (float)($rate_outside ?: $daily_rate);
+$max_seats = max(1, (int)($vehicle_seats ?: 1));
 
 if (!$rate_cdo && !$rate_outside) {
   header('Content-Type: application/json');
@@ -329,14 +348,14 @@ $balance_due = round($total_cost - $downpayment, 2);
 ========================== */
 $insert = $conn->prepare("
   INSERT INTO rentals (
-    vehicle_id, customer_id, start_date, start_time, end_date, end_time,
+    vehicle_id, customer_id, passenger_count, start_date, start_time, end_date, end_time,
     daily_rate, applied_rate, rate_type, 
     promo_applied, promo_discount, total_cost, 
     downpayment, balance_due, status, created_at
-  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NOW())
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'waitlist', NOW())
 ");
-$insert->bind_param("iissssddssdddd", 
-  $vehicle_id, $user_id, $start_date, $start_time, $end_date, $end_time, // User-selected pickup and return times
+$insert->bind_param("iiissssddssdddd", 
+  $vehicle_id, $user_id, $passenger_count, $start_date, $start_time, $end_date, $end_time,
   $base_rate, $promo_data['applied_rate'], $rate_type,
   $promo_data['promo_applied'], $promo_data['promo_discount'], $total_cost,
   $downpayment, $balance_due
@@ -352,7 +371,7 @@ $insert->close();
    ADD NOTIFICATIONS
 ========================== */
 // Booking notification
-$message = "📝 Your booking for <b>" . htmlspecialchars($display_name) . "</b> has been submitted and is pending admin approval.";
+$message = "⏳ Your booking for <b>" . htmlspecialchars($display_name) . "</b> is on hold until you pay. Submit your downpayment receipt to move it to pending.";
 require_once __DIR__ . '/notification_manager.php';
 createNotificationIfNotExists($conn, $user_id, $vehicle_id, $message);
 
@@ -362,7 +381,7 @@ createPromoNotification($user_id, $vehicle_id, $promo_data);
 /* ==========================
    SUCCESS RESPONSE
 ========================== */
-$successMsg = "✅ Booking successful! Please wait for admin approval.";
+$successMsg = "Your booking is on hold until you pay. Submit your downpayment receipt or it will stay on hold and will not be approved.";
 if ($promo_data['promo_applied']) {
   $successMsg .= " You received a {$promo_data['discount_percent']}% discount!";
 }

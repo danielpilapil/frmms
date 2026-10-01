@@ -9,6 +9,8 @@ session_name('fleetgo_session_user');
 session_start();
 
 require_once __DIR__ . '/includes/db.php';
+require_once __DIR__ . '/includes/vehicle_promo.php';
+vehicle_promo_ensure_columns($conn);
 
 /* --- Access Control --- */
 if (!isset($_SESSION['user_id'])) {
@@ -173,7 +175,8 @@ if ($favoritesEnabled) {
 
   try {
     $stmt = $conn->prepare("\
-      SELECT v.id, v.make_model, v.vehicle_type, v.seats, v.transmission, v.photo, v.current_status, v.daily_rate
+      SELECT v.id, v.make_model, v.vehicle_type, v.seats, v.transmission, v.photo, v.current_status, v.daily_rate,
+             v.daily_rate_cdo, v.promo_discount_type, v.promo_discount_value, v.promo_starts_at, v.promo_ends_at
       FROM user_favorites uf
       JOIN vehicles v ON v.id = uf.vehicle_id
       WHERE uf.user_id = ?
@@ -192,7 +195,8 @@ if ($favoritesEnabled) {
 if ($recentViewsEnabled) {
   try {
     $stmt = $conn->prepare("\
-      SELECT v.id, v.make_model, v.vehicle_type, v.seats, v.transmission, v.photo, v.current_status, v.daily_rate
+      SELECT v.id, v.make_model, v.vehicle_type, v.seats, v.transmission, v.photo, v.current_status, v.daily_rate,
+             v.daily_rate_cdo, v.promo_discount_type, v.promo_discount_value, v.promo_starts_at, v.promo_ends_at
       FROM (
         SELECT vehicle_id, MAX(viewed_at) AS last_viewed
         FROM user_recent_views
@@ -284,8 +288,9 @@ try{
 // Available today (main booking cards)
 $availableToday = [];
 try{
-  $sql = "\
-    SELECT v.id, v.make_model, v.vehicle_type, v.seats, v.transmission, v.photo, v.current_status, v.daily_rate
+  $sql = "
+    SELECT v.id, v.make_model, v.vehicle_type, v.seats, v.transmission, v.photo, v.current_status, v.daily_rate,
+           v.daily_rate_cdo, v.promo_discount_type, v.promo_discount_value, v.promo_starts_at, v.promo_ends_at
     FROM vehicles v
     WHERE v.current_status = 'available'
     ORDER BY v.make_model ASC
@@ -314,8 +319,9 @@ try{
 
   if ($pref && !empty($pref['vehicle_type'])) {
     $vehicleType = (string)$pref['vehicle_type'];
-    $stmt = $conn->prepare("\
-      SELECT id, make_model, vehicle_type, seats, transmission, photo, current_status, daily_rate
+    $stmt = $conn->prepare("
+      SELECT id, make_model, vehicle_type, seats, transmission, photo, current_status, daily_rate,
+             daily_rate_cdo, promo_discount_type, promo_discount_value, promo_starts_at, promo_ends_at
       FROM vehicles
       WHERE vehicle_type = ?
       ORDER BY current_status = 'available' DESC, make_model ASC
@@ -331,8 +337,9 @@ try{
 // Popular vehicles (top 5 by rentals)
 $popular = [];
 try{
-  $sql = "\
+  $sql = "
     SELECT v.id, v.make_model, v.vehicle_type, v.seats, v.transmission, v.photo, v.current_status, v.daily_rate,
+           v.daily_rate_cdo, v.promo_discount_type, v.promo_discount_value, v.promo_starts_at, v.promo_ends_at,
            t.total
     FROM (
       SELECT vehicle_id, COUNT(*) AS total
@@ -931,6 +938,19 @@ body::before{
 .v-title{font-weight:900;font-size:1.05rem;margin:0 0 8px;letter-spacing:-.3px}
 .v-meta{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
 .v-price{font-weight:900;font-size:1.15rem;margin-bottom:10px}
+.v-price.has-promo{display:flex;flex-direction:column;align-items:flex-start;gap:4px}
+.v-price .promo-pill{
+  display:inline-flex;align-items:center;padding:3px 8px;border-radius:999px;
+  background:linear-gradient(135deg,#5dd0ff,#7cffc7);color:#041b22;
+  font-size:.68rem;font-weight:900;letter-spacing:.3px;text-transform:uppercase;
+}
+.v-price .price-now{font-weight:900;font-size:1.15rem;color:#7cffc7}
+.v-price .price-now span{font-size:.85rem;opacity:.8;font-weight:800}
+.v-price .price-was{font-size:.82rem;font-weight:800;color:var(--text-secondary);text-decoration:line-through}
+.notif-item .v-price{font-size:.85rem;margin-bottom:0}
+.notif-item .v-price .promo-pill{font-size:.6rem;padding:2px 6px}
+.notif-item .v-price .price-now{font-size:.85rem}
+.notif-item .v-price .price-was{font-size:.72rem}
 .v-actions{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .v-top{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
 .fav-btn{
@@ -1131,9 +1151,8 @@ body::before{
             <div class="cards">
               <?php foreach ($availableToday as $v):
                 $status = strtolower(trim((string)($v['current_status'] ?? '')));
-                $badge = $status === 'available' ? 'green' : ($status === 'rented' ? 'yellow' : ($status === 'maintenance' || $status === 'scheduled_maintenance' ? 'red' : 'blue'));
-                $badgeText = $status === 'available' ? 'Available' : ucfirst(str_replace('_',' ', $status));
-                $canBook = ($status === 'available') && $isApproved;
+                $isMaint = in_array($status, ['maintenance','scheduled_maintenance','inspection','unavailable'], true);
+                $canBook = !$isMaint && $isApproved;
               ?>
                 <article class="v-card">
                   <img class="v-img" src="<?= h(vehicle_img($v)) ?>" alt="<?= h($v['make_model'] ?? '') ?>">
@@ -1141,13 +1160,12 @@ body::before{
                     <div class="v-top">
                       <div style="min-width:0;">
                         <h4 class="v-title"><?= h($v['make_model'] ?? '') ?></h4>
-                        <span class="badge <?= h($badge) ?>"><?= h($badgeText) ?></span>
                       </div>
                       <button class="fav-btn <?= !$favoritesEnabled ? 'disabled' : '' ?> <?= isset($favoriteIds[(int)$v['id']]) ? 'active' : '' ?>" type="button"
                         title="<?= $favoritesEnabled ? (isset($favoriteIds[(int)$v['id']]) ? 'Remove favorite' : 'Add to favorites') : 'Favorites not available' ?>"
                         data-fav="1" data-id="<?= (int)$v['id'] ?>" <?= !$favoritesEnabled ? 'disabled' : '' ?>>♥</button>
                     </div>
-                    <div class="v-price">₱<?= number_format((float)($v['daily_rate'] ?? 0), 2) ?>/day</div>
+                    <?= render_vehicle_price_html($v) ?>
                     <div class="v-meta">
                       <span class="pill"><?= h($v['transmission'] ?? '') ?></span>
                       <span class="pill"><?= (int)($v['seats'] ?? 0) ?> seats</span>
@@ -1159,12 +1177,12 @@ body::before{
                         data-type="<?= h($v['vehicle_type'] ?? '') ?>"
                         data-trans="<?= h($v['transmission'] ?? '') ?>"
                         data-seats="<?= (int)($v['seats'] ?? 0) ?>"
-                        data-rate="<?= number_format((float)($v['daily_rate'] ?? 0), 2, '.', '') ?>"
+                        data-rate="<?= number_format(vehicle_promo_pricing($v)['effective'], 2, '.', '') ?>"
                         data-status="<?= h($v['current_status'] ?? '') ?>">View Details</a>
                       <?php if ($canBook): ?>
                         <a class="btn primary js-book-link" href="vehiclepage.php" data-id="<?= (int)$v['id'] ?>" data-name="<?= h($v['make_model'] ?? '') ?>">Book Now</a>
                       <?php else: ?>
-                        <button class="btn disabled" type="button" disabled><?= $isApproved ? 'Unavailable' : 'Profile Pending' ?></button>
+                        <button class="btn disabled" type="button" disabled><?= $isMaint ? 'Maintenance' : ($isApproved ? 'Unavailable' : 'Profile Pending') ?></button>
                       <?php endif; ?>
                     </div>
                   </div>
@@ -1187,9 +1205,8 @@ body::before{
             <div class="cards">
               <?php foreach ($recommended as $v):
                 $status = strtolower(trim((string)($v['current_status'] ?? '')));
-                $badge = $status === 'available' ? 'green' : ($status === 'rented' ? 'yellow' : ($status === 'maintenance' || $status === 'scheduled_maintenance' ? 'red' : 'blue'));
-                $badgeText = $status === 'available' ? 'Available' : ucfirst(str_replace('_',' ', $status));
-                $canBook = ($status === 'available') && $isApproved;
+                $isMaint = in_array($status, ['maintenance','scheduled_maintenance','inspection','unavailable'], true);
+                $canBook = !$isMaint && $isApproved;
               ?>
                 <article class="v-card">
                   <img class="v-img" src="<?= h(vehicle_img($v)) ?>" alt="<?= h($v['make_model'] ?? '') ?>">
@@ -1197,13 +1214,12 @@ body::before{
                     <div class="v-top">
                       <div style="min-width:0;">
                         <h4 class="v-title"><?= h($v['make_model'] ?? '') ?></h4>
-                        <span class="badge <?= h($badge) ?>"><?= h($badgeText) ?></span>
                       </div>
                       <button class="fav-btn <?= !$favoritesEnabled ? 'disabled' : '' ?> <?= isset($favoriteIds[(int)$v['id']]) ? 'active' : '' ?>" type="button"
                         title="<?= $favoritesEnabled ? (isset($favoriteIds[(int)$v['id']]) ? 'Remove favorite' : 'Add to favorites') : 'Favorites not available' ?>"
                         data-fav="1" data-id="<?= (int)$v['id'] ?>" <?= !$favoritesEnabled ? 'disabled' : '' ?>>♥</button>
                     </div>
-                    <div class="v-price">₱<?= number_format((float)($v['daily_rate'] ?? 0), 2) ?>/day</div>
+                    <?= render_vehicle_price_html($v) ?>
                     <div class="v-meta">
                       <span class="pill"><?= h($v['transmission'] ?? '') ?></span>
                       <span class="pill"><?= (int)($v['seats'] ?? 0) ?> seats</span>
@@ -1215,12 +1231,12 @@ body::before{
                         data-type="<?= h($v['vehicle_type'] ?? '') ?>"
                         data-trans="<?= h($v['transmission'] ?? '') ?>"
                         data-seats="<?= (int)($v['seats'] ?? 0) ?>"
-                        data-rate="<?= number_format((float)($v['daily_rate'] ?? 0), 2, '.', '') ?>"
+                        data-rate="<?= number_format(vehicle_promo_pricing($v)['effective'], 2, '.', '') ?>"
                         data-status="<?= h($v['current_status'] ?? '') ?>">View Details</a>
                       <?php if ($canBook): ?>
                         <a class="btn primary js-book-link" href="vehiclepage.php" data-id="<?= (int)$v['id'] ?>" data-name="<?= h($v['make_model'] ?? '') ?>">Book Now</a>
                       <?php else: ?>
-                        <button class="btn disabled" type="button" disabled><?= $isApproved ? 'Unavailable' : 'Profile Pending' ?></button>
+                        <button class="btn disabled" type="button" disabled><?= $isMaint ? 'Maintenance' : ($isApproved ? 'Unavailable' : 'Profile Pending') ?></button>
                       <?php endif; ?>
                     </div>
                   </div>
@@ -1243,9 +1259,8 @@ body::before{
             <div class="cards">
               <?php foreach ($popular as $v):
                 $status = strtolower(trim((string)($v['current_status'] ?? '')));
-                $badge = $status === 'available' ? 'green' : ($status === 'rented' ? 'yellow' : ($status === 'maintenance' || $status === 'scheduled_maintenance' ? 'red' : 'blue'));
-                $badgeText = $status === 'available' ? 'Available' : ucfirst(str_replace('_',' ', $status));
-                $canBook = ($status === 'available') && $isApproved;
+                $isMaint = in_array($status, ['maintenance','scheduled_maintenance','inspection','unavailable'], true);
+                $canBook = !$isMaint && $isApproved;
               ?>
                 <article class="v-card">
                   <img class="v-img" src="<?= h(vehicle_img($v)) ?>" alt="<?= h($v['make_model'] ?? '') ?>">
@@ -1253,13 +1268,12 @@ body::before{
                     <div class="v-top">
                       <div style="min-width:0;">
                         <h4 class="v-title"><?= h($v['make_model'] ?? '') ?></h4>
-                        <span class="badge <?= h($badge) ?>"><?= h($badgeText) ?></span>
                       </div>
                       <button class="fav-btn <?= !$favoritesEnabled ? 'disabled' : '' ?> <?= isset($favoriteIds[(int)$v['id']]) ? 'active' : '' ?>" type="button"
                         title="<?= $favoritesEnabled ? (isset($favoriteIds[(int)$v['id']]) ? 'Remove favorite' : 'Add to favorites') : 'Favorites not available' ?>"
                         data-fav="1" data-id="<?= (int)$v['id'] ?>" <?= !$favoritesEnabled ? 'disabled' : '' ?>>♥</button>
                     </div>
-                    <div class="v-price">₱<?= number_format((float)($v['daily_rate'] ?? 0), 2) ?>/day</div>
+                    <?= render_vehicle_price_html($v) ?>
                     <div class="v-meta">
                       <span class="pill"><?= h($v['transmission'] ?? '') ?></span>
                       <span class="pill"><?= (int)($v['seats'] ?? 0) ?> seats</span>
@@ -1271,12 +1285,12 @@ body::before{
                         data-type="<?= h($v['vehicle_type'] ?? '') ?>"
                         data-trans="<?= h($v['transmission'] ?? '') ?>"
                         data-seats="<?= (int)($v['seats'] ?? 0) ?>"
-                        data-rate="<?= number_format((float)($v['daily_rate'] ?? 0), 2, '.', '') ?>"
+                        data-rate="<?= number_format(vehicle_promo_pricing($v)['effective'], 2, '.', '') ?>"
                         data-status="<?= h($v['current_status'] ?? '') ?>">View Details</a>
                       <?php if ($canBook): ?>
                         <a class="btn primary js-book-link" href="vehiclepage.php" data-id="<?= (int)$v['id'] ?>" data-name="<?= h($v['make_model'] ?? '') ?>">Book Now</a>
                       <?php else: ?>
-                        <button class="btn disabled" type="button" disabled><?= $isApproved ? 'Unavailable' : 'Profile Pending' ?></button>
+                        <button class="btn disabled" type="button" disabled><?= $isMaint ? 'Maintenance' : ($isApproved ? 'Unavailable' : 'Profile Pending') ?></button>
                       <?php endif; ?>
                     </div>
                   </div>
@@ -1323,7 +1337,7 @@ body::before{
           <span class="badge green">Fast Flow</span>
         </div>
         <div class="panel-b" style="color:var(--text-secondary);">
-          <div style="margin-bottom:10px;">Dashboard → View Vehicle → Book → Pending → Approved → Ongoing → Completed</div>
+          <div style="margin-bottom:10px;">Dashboard → View Vehicle → Book → Waitlist → Pay and submit receipt → Pending → Approved → Ongoing → Completed</div>
           <?php if (!$isApproved): ?>
             <div class="notif-item unread" style="margin:0;">
               <div style="font-weight:900;margin-bottom:6px;">Complete your profile to start renting</div>
@@ -1351,7 +1365,7 @@ body::before{
                       <div style="font-weight:900;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
                         <?= h($v['make_model'] ?? '') ?>
                       </div>
-                      <div style="color:var(--text-muted);font-size:.85rem;">₱<?= number_format((float)($v['daily_rate'] ?? 0), 2) ?>/day</div>
+                      <?= render_vehicle_price_html($v) ?>
                     </div>
                     <a class="btn js-book-link" href="vehiclepage.php" data-id="<?= (int)$v['id'] ?>" data-name="<?= h($v['make_model'] ?? '') ?>" style="width:auto;">Book</a>
                   </div>
@@ -1382,14 +1396,15 @@ body::before{
                       <div style="font-weight:900;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
                         <?= h($v['make_model'] ?? '') ?>
                       </div>
-                      <div style="color:var(--text-muted);font-size:.85rem;"><?= h($v['vehicle_type'] ?? '') ?> • ₱<?= number_format((float)($v['daily_rate'] ?? 0), 2) ?>/day</div>
+                      <div style="color:var(--text-muted);font-size:.85rem;margin-bottom:2px;"><?= h($v['vehicle_type'] ?? '') ?></div>
+                      <?= render_vehicle_price_html($v) ?>
                     </div>
                     <a class="btn js-view-link" href="vehiclepage.php" data-id="<?= (int)$v['id'] ?>"
                       data-name="<?= h($v['make_model'] ?? '') ?>"
                       data-type="<?= h($v['vehicle_type'] ?? '') ?>"
                       data-trans="<?= h($v['transmission'] ?? '') ?>"
                       data-seats="<?= (int)($v['seats'] ?? 0) ?>"
-                      data-rate="<?= number_format((float)($v['daily_rate'] ?? 0), 2, '.', '') ?>"
+                      data-rate="<?= number_format(vehicle_promo_pricing($v)['effective'], 2, '.', '') ?>"
                       data-status="<?= h($v['current_status'] ?? '') ?>" style="width:auto;">Details</a>
                   </div>
                 </div>
@@ -1484,6 +1499,36 @@ document.querySelectorAll('.js-view-link, .js-book-link').forEach(a => {
     const href = a.getAttribute('href') || 'vehiclepage.php';
     markViewThenGo(vid, href);
   });
+});
+
+/* Live-refresh vehicle promo prices on dashboard browse cards */
+async function refreshBrowsePromoPrices(){
+  const nodes = Array.from(document.querySelectorAll('[data-vehicle-price]'));
+  if (!nodes.length) return;
+  const ids = [...new Set(nodes.map(n => n.getAttribute('data-vehicle-price')).filter(Boolean))];
+  if (!ids.length) return;
+  try {
+    const res = await fetch(`vehiclepage.php?ajax=1&action=promo_prices&ids=${encodeURIComponent(ids.join(','))}`);
+    const json = await res.json();
+    if (!json || !json.success || !json.prices) return;
+    nodes.forEach(node => {
+      const id = String(node.getAttribute('data-vehicle-price') || '');
+      const info = json.prices[id];
+      if (!info || !info.html) return;
+      const wrap = document.createElement('div');
+      wrap.innerHTML = info.html.trim();
+      const next = wrap.firstElementChild;
+      if (next) node.replaceWith(next);
+      document.querySelectorAll(`.js-view-link[data-id="${id}"], .js-book-link[data-id="${id}"]`).forEach(btn => {
+        btn.setAttribute('data-rate', Number(info.effective || 0).toFixed(2));
+      });
+    });
+  } catch (e) {}
+}
+refreshBrowsePromoPrices();
+setInterval(refreshBrowsePromoPrices, 5000);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) refreshBrowsePromoPrices();
 });
 </script>
 </body>

@@ -55,7 +55,7 @@ if (!$start || !$end || $end < $start) {
 /* ==========================
    GET VEHICLE RATE
 ========================== */
-$stmt = $conn->prepare("SELECT daily_rate_cdo, daily_rate_outside_cdo FROM vehicles WHERE id = ?");
+$stmt = $conn->prepare("SELECT daily_rate, daily_rate_cdo, daily_rate_outside_cdo FROM vehicles WHERE id = ?");
 $stmt->bind_param("i", $vehicle_id);
 $stmt->execute();
 $vehicle = $stmt->get_result()->fetch_assoc();

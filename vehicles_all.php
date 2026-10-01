@@ -47,7 +47,63 @@ function type_fallback($type){
   if(strpos($t,'pickup')!==false)return'vehicles/pickup.jpg';
   if(strpos($t,'suv')!==false)return'vehicles/suv.jpg';
   if(strpos($t,'van')!==false)return'vehicles/minivan.jpg';
-  return'vehicles/sedan.jpg';
+  return 'vehicles/images.jpeg';
+}
+
+// Ensure vehicle columns used by the admin form exist
+$vehicleSchema = [
+  'chassis_number' => "ADD COLUMN chassis_number VARCHAR(64) NULL DEFAULT NULL AFTER plate_no",
+  'engine_number' => "ADD COLUMN engine_number VARCHAR(64) NULL DEFAULT NULL AFTER chassis_number",
+  'ownership_type' => "ADD COLUMN ownership_type VARCHAR(32) NULL DEFAULT 'Personal' AFTER make_model",
+  'vehicle_condition' => "ADD COLUMN vehicle_condition VARCHAR(32) NULL DEFAULT NULL AFTER vehicle_type",
+  'category' => "ADD COLUMN category VARCHAR(32) NULL DEFAULT NULL AFTER vehicle_condition",
+  'fuel_type' => "ADD COLUMN fuel_type VARCHAR(32) NULL DEFAULT NULL AFTER transmission",
+  'max_capacity_kg' => "ADD COLUMN max_capacity_kg DECIMAL(10,2) NULL DEFAULT NULL AFTER seats",
+  'fuel_level' => "ADD COLUMN fuel_level ENUM('full','3/4','half','1/4','empty') NULL DEFAULT NULL AFTER fuel_type",
+  'promo_discount_type' => "ADD COLUMN promo_discount_type ENUM('none','percent','fixed') NOT NULL DEFAULT 'none' AFTER daily_rate_outside_cdo",
+  'promo_discount_value' => "ADD COLUMN promo_discount_value DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER promo_discount_type",
+  'promo_starts_at' => "ADD COLUMN promo_starts_at DATETIME NULL DEFAULT NULL AFTER promo_discount_value",
+  'promo_ends_at' => "ADD COLUMN promo_ends_at DATETIME NULL DEFAULT NULL AFTER promo_starts_at",
+  'listing_description' => "ADD COLUMN listing_description TEXT NULL DEFAULT NULL",
+];
+foreach ($vehicleSchema as $col => $ddl) {
+  if (!column_exists($conn, 'vehicles', $col)) {
+    try {
+      $conn->query("ALTER TABLE vehicles $ddl");
+    } catch (Throwable $e) {
+      error_log("vehicles schema ensure failed for {$col}: " . $e->getMessage());
+    }
+  }
+}
+// Seed fuel_level from the latest return inspection when still empty
+if (column_exists($conn, 'vehicles', 'fuel_level')) {
+  try {
+    $conn->query("
+      UPDATE vehicles v
+      INNER JOIN (
+        SELECT r.vehicle_id, ri.fuel_level
+        FROM return_inspections ri
+        INNER JOIN rentals r ON r.id = ri.rental_id
+        INNER JOIN (
+          SELECT r2.vehicle_id, MAX(ri2.id) AS max_id
+          FROM return_inspections ri2
+          INNER JOIN rentals r2 ON r2.id = ri2.rental_id
+          WHERE ri2.fuel_level IS NOT NULL AND ri2.fuel_level <> ''
+          GROUP BY r2.vehicle_id
+        ) latest ON latest.max_id = ri.id
+      ) src ON src.vehicle_id = v.id
+      SET v.fuel_level = src.fuel_level
+      WHERE v.fuel_level IS NULL
+    ");
+  } catch (Throwable $e) {
+    error_log('fuel_level backfill failed: ' . $e->getMessage());
+  }
+}
+// Expand vehicle_type enum if needed so form values save cleanly
+try {
+  $conn->query("ALTER TABLE vehicles MODIFY COLUMN vehicle_type ENUM('SUV','Sedan','Motorcycle','Hatchback','Pickup Truck','Crossover','Minivan','Van','Other') NULL");
+} catch (Throwable $e) {
+  // ignore if already compatible
 }
 
 /* ---------- AJAX: fetch single ---------- */
@@ -56,6 +112,67 @@ if(isset($_GET['get'])){
   $stmt=$conn->prepare("SELECT * FROM vehicles WHERE id=? LIMIT 1");
   $stmt->bind_param('i',$id);$stmt->execute();
   $r=$stmt->get_result()->fetch_assoc();
+  $stmt->close();
+
+  // Prefer stored vehicle fuel_level; fallback to latest return inspection / rental return
+  if ($r && (empty($r['fuel_level']) || $r['fuel_level'] === null)) {
+    $fuelFromReturn = null;
+    try {
+      $fuelStmt = $conn->prepare("
+        SELECT ri.fuel_level
+        FROM return_inspections ri
+        JOIN rentals r2 ON r2.id = ri.rental_id
+        WHERE r2.vehicle_id = ?
+          AND ri.fuel_level IS NOT NULL
+          AND ri.fuel_level <> ''
+        ORDER BY ri.created_at DESC, ri.id DESC
+        LIMIT 1
+      ");
+      $fuelStmt->bind_param('i', $id);
+      $fuelStmt->execute();
+      $fuelRow = $fuelStmt->get_result()->fetch_assoc();
+      $fuelStmt->close();
+      if (!empty($fuelRow['fuel_level'])) {
+        $fuelFromReturn = $fuelRow['fuel_level'];
+      }
+    } catch (Throwable $e) {
+      // ignore fallback errors
+    }
+    if ($fuelFromReturn === null) {
+      try {
+        $fuelStmt = $conn->prepare("
+          SELECT rr.fuel_level
+          FROM rental_returns rr
+          JOIN rentals r2 ON r2.id = rr.rental_id
+          WHERE r2.vehicle_id = ?
+            AND rr.fuel_level IS NOT NULL
+            AND rr.fuel_level <> ''
+          ORDER BY rr.created_at DESC, rr.id DESC
+          LIMIT 1
+        ");
+        $fuelStmt->bind_param('i', $id);
+        $fuelStmt->execute();
+        $fuelRow = $fuelStmt->get_result()->fetch_assoc();
+        $fuelStmt->close();
+        if (!empty($fuelRow['fuel_level'])) {
+          $fuelFromReturn = $fuelRow['fuel_level'];
+        }
+      } catch (Throwable $e) {
+        // ignore
+      }
+    }
+    if ($fuelFromReturn !== null) {
+      // Normalize legacy rental_returns value "1/2" → "half"
+      if ($fuelFromReturn === '1/2') {
+        $fuelFromReturn = 'half';
+      }
+      $allowed = ['full','3/4','half','1/4','empty'];
+      if (in_array($fuelFromReturn, $allowed, true)) {
+        $r['fuel_level'] = $fuelFromReturn;
+      }
+    }
+  }
+
   header('Content-Type:application/json');echo json_encode($r??[]);exit;
 }
 
@@ -81,13 +198,51 @@ if($_SERVER['REQUEST_METHOD']==='POST' && ($_POST['form_type']??'')==='save'){
   $ownership_type=clean_str($_POST['ownership_type']??($_POST['classification']??'Personal'));
   $type=clean_str($_POST['vehicle_type']??'Sedan');
   $seats=(int)($_POST['seats']??0);
+  $max_capacity_kg = ($_POST['max_capacity_kg'] ?? '') === '' ? null : (float)$_POST['max_capacity_kg'];
   $year=(int)($_POST['year']??0);
   $odo=(float)($_POST['odometer']??0);
   $rate_cdo=(float)($_POST['daily_rate_cdo']??0);
   $rate_outside=(float)($_POST['daily_rate_outside_cdo']??0);
+  $promo_discount_type = strtolower(trim((string)($_POST['promo_discount_type'] ?? 'none')));
+  if (!in_array($promo_discount_type, ['none', 'percent', 'fixed'], true)) {
+    $promo_discount_type = 'none';
+  }
+  $promo_discount_value = (float)($_POST['promo_discount_value'] ?? 0);
+  $promo_start_date = trim((string)($_POST['promo_start_date'] ?? ''));
+  $promo_start_time = trim((string)($_POST['promo_start_time'] ?? '00:00'));
+  $promo_end_date = trim((string)($_POST['promo_end_date'] ?? ''));
+  $promo_end_time = trim((string)($_POST['promo_end_time'] ?? '23:59'));
+  $promo_starts_at = null;
+  $promo_ends_at = null;
+
+  if ($promo_discount_type === 'none' || $promo_discount_value <= 0) {
+    $promo_discount_type = 'none';
+    $promo_discount_value = 0.0;
+  }
+  if ($promo_discount_type === 'percent' && $promo_discount_value > 100) {
+    $promo_discount_value = 100.0;
+  }
+
+  if ($promo_discount_type !== 'none') {
+    if ($promo_start_date === '' || $promo_end_date === '') {
+      $_SESSION['flash_error'] = 'Please set promo start and end date/time.';
+      header("Location: ".$_SERVER['PHP_SELF']); exit;
+    }
+    if (!preg_match('/^\d{2}:\d{2}/', $promo_start_time)) $promo_start_time = '00:00';
+    if (!preg_match('/^\d{2}:\d{2}/', $promo_end_time)) $promo_end_time = '23:59';
+    $promo_starts_at = $promo_start_date . ' ' . substr($promo_start_time, 0, 5) . ':00';
+    $promo_ends_at = $promo_end_date . ' ' . substr($promo_end_time, 0, 5) . ':00';
+    $startTs = strtotime($promo_starts_at);
+    $endTs = strtotime($promo_ends_at);
+    if (!$startTs || !$endTs || $endTs <= $startTs) {
+      $_SESSION['flash_error'] = 'Promo end date/time must be after the start date/time.';
+      header("Location: ".$_SERVER['PHP_SELF']); exit;
+    }
+  }
   $trans=clean_str($_POST['transmission']??'MT');
   $comfort=clean_str($_POST['comfort_level']??'Standard');
   $fuel=clean_str($_POST['fuel_type']??'');
+  $fuel_level=clean_str($_POST['fuel_level']??'');
   $vehicle_condition=clean_str($_POST['vehicle_condition']??($_POST['condition_status']??''));
   $category=clean_str($_POST['category']??'');
   
@@ -95,6 +250,13 @@ if($_SERVER['REQUEST_METHOD']==='POST' && ($_POST['form_type']??'')==='save'){
   $allowedOwnershipTypes = ['Personal','Company'];
   $allowedVehicleConditions = ['Excellent','Good','Fair','Poor'];
   $allowedCategories = ['Economy','Standard','Premium','Luxury'];
+  $allowedFuelLevels = ['full','3/4','half','1/4','empty'];
+  if ($fuel_level !== '' && !in_array($fuel_level, $allowedFuelLevels, true)) {
+    $fuel_level = '';
+  }
+  if ($fuel_level === '') {
+    $fuel_level = null;
+  }
   
   $cond_upper = strtoupper($vehicle_condition);
   if ($vehicle_condition === '' && $cond_upper !== '') {
@@ -122,6 +284,10 @@ if($_SERVER['REQUEST_METHOD']==='POST' && ($_POST['form_type']??'')==='save'){
   }
   if ($category !== '' && !in_array($category, $allowedCategories, true)) {
     $_SESSION['flash_error'] = 'Invalid Category selected.';
+    header("Location: ".$_SERVER['PHP_SELF']);exit;
+  }
+  if ($max_capacity_kg !== null && $max_capacity_kg <= 0) {
+    $_SESSION['flash_error'] = 'Maximum Capacity (KG) must be greater than 0.';
     header("Location: ".$_SERVER['PHP_SELF']);exit;
   }
   
@@ -164,86 +330,129 @@ if($_SERVER['REQUEST_METHOD']==='POST' && ($_POST['form_type']??'')==='save'){
   $has_vehicle_condition = column_exists($conn, 'vehicles', 'vehicle_condition');
   $has_ownership_type = column_exists($conn, 'vehicles', 'ownership_type');
   $has_classification = column_exists($conn, 'vehicles', 'classification');
+  $has_max_capacity_kg = column_exists($conn, 'vehicles', 'max_capacity_kg');
+  $has_chassis = column_exists($conn, 'vehicles', 'chassis_number');
+  $has_engine = column_exists($conn, 'vehicles', 'engine_number');
+  $has_fuel_type = column_exists($conn, 'vehicles', 'fuel_type');
+  $has_fuel_level = column_exists($conn, 'vehicles', 'fuel_level');
+  $has_promo_type = column_exists($conn, 'vehicles', 'promo_discount_type');
+  $has_promo_value = column_exists($conn, 'vehicles', 'promo_discount_value');
+  $has_promo_starts = column_exists($conn, 'vehicles', 'promo_starts_at');
+  $has_promo_ends = column_exists($conn, 'vehicles', 'promo_ends_at');
+  $has_listing = column_exists($conn, 'vehicles', 'listing_description');
+  $listing_description = trim((string)($_POST['listing_description'] ?? ''));
+  if (function_exists('mb_substr')) {
+    $listing_description = mb_substr($listing_description, 0, 2000);
+  } else {
+    $listing_description = substr($listing_description, 0, 2000);
+  }
 
   if($id){
-    // Always include photo field in UPDATE to handle both removal and new upload
-    $sql = "UPDATE vehicles SET plate_no=?,chassis_number=?,engine_number=?,maker=?,model=?,make_model=?,vehicle_type=?,seats=?,year=?,odometer=?,daily_rate=?,daily_rate_cdo=?,daily_rate_outside_cdo=?,transmission=?,comfort_level=?,fuel_type=?";
-    $types = "sssssss iiddddsss";
-    $types = str_replace(' ','',$types);
-    $params = [$plate,$chassis,$engine,$maker,$model,$make_model,$type,$seats,$year,$odo,$daily_rate,$rate_cdo,$rate_outside,$trans,$comfort,$fuel];
+    $sets = [];
+    $types = '';
+    $params = [];
+
+    $sets[] = 'plate_no=?'; $types .= 's'; $params[] = $plate;
+    if ($has_chassis) { $sets[] = 'chassis_number=?'; $types .= 's'; $params[] = $chassis; }
+    if ($has_engine) { $sets[] = 'engine_number=?'; $types .= 's'; $params[] = $engine; }
+    $sets[] = 'maker=?'; $types .= 's'; $params[] = $maker;
+    $sets[] = 'model=?'; $types .= 's'; $params[] = $model;
+    $sets[] = 'make_model=?'; $types .= 's'; $params[] = $make_model;
+    $sets[] = 'vehicle_type=?'; $types .= 's'; $params[] = $type;
+    $sets[] = 'seats=?'; $types .= 'i'; $params[] = $seats;
+    $sets[] = 'year=?'; $types .= 'i'; $params[] = $year;
+    $sets[] = 'odometer=?'; $types .= 'd'; $params[] = $odo;
+    $sets[] = 'daily_rate=?'; $types .= 'd'; $params[] = $daily_rate;
+    $sets[] = 'daily_rate_cdo=?'; $types .= 'd'; $params[] = $rate_cdo;
+    $sets[] = 'daily_rate_outside_cdo=?'; $types .= 'd'; $params[] = $rate_outside;
+    if ($has_promo_type) { $sets[] = 'promo_discount_type=?'; $types .= 's'; $params[] = $promo_discount_type; }
+    if ($has_promo_value) { $sets[] = 'promo_discount_value=?'; $types .= 'd'; $params[] = $promo_discount_value; }
+    if ($has_promo_starts) { $sets[] = 'promo_starts_at=?'; $types .= 's'; $params[] = $promo_starts_at; }
+    if ($has_promo_ends) { $sets[] = 'promo_ends_at=?'; $types .= 's'; $params[] = $promo_ends_at; }
+    $sets[] = 'transmission=?'; $types .= 's'; $params[] = $trans;
+    $sets[] = 'comfort_level=?'; $types .= 's'; $params[] = $comfort;
+    if ($has_listing) { $sets[] = 'listing_description=?'; $types .= 's'; $params[] = $listing_description; }
+    if ($has_fuel_type) { $sets[] = 'fuel_type=?'; $types .= 's'; $params[] = $fuel; }
+    if ($has_fuel_level) { $sets[] = 'fuel_level=?'; $types .= 's'; $params[] = $fuel_level; }
 
     if($has_ownership_type){
-      $sql .= ",ownership_type=?";
-      $types .= "s";
-      $params[] = $ownership_type;
+      $sets[] = 'ownership_type=?'; $types .= 's'; $params[] = $ownership_type;
     } elseif($has_classification){
-      $sql .= ",classification=?";
-      $types .= "s";
-      $params[] = $ownership_type;
+      $sets[] = 'classification=?'; $types .= 's'; $params[] = $ownership_type;
     }
 
     if($has_vehicle_condition){
-      $sql .= ",vehicle_condition=?";
-      $types .= "s";
-      $params[] = $vehicle_condition;
+      $sets[] = 'vehicle_condition=?'; $types .= 's'; $params[] = $vehicle_condition;
     } elseif($has_condition_status){
-      $sql .= ",condition_status=?";
-      $types .= "s";
-      $params[] = $vehicle_condition;
+      $sets[] = 'condition_status=?'; $types .= 's'; $params[] = $vehicle_condition;
     }
     if($has_category){
-      $sql .= ",category=?";
-      $types .= "s";
-      $params[] = ($category !== '' ? $category : null);
+      $sets[] = 'category=?'; $types .= 's'; $params[] = ($category !== '' ? $category : null);
     }
-    $sql .= ",photo=? WHERE id=?";
-    $types .= "si";
-    $params[] = $photo;
-    $params[] = $id;
+    if($has_max_capacity_kg){
+      $sets[] = 'max_capacity_kg=?'; $types .= 's';
+      $params[] = ($max_capacity_kg === null ? null : number_format($max_capacity_kg, 2, '.', ''));
+    }
+
+    $sets[] = 'photo=?'; $types .= 's'; $params[] = $photo;
+    $types .= 'i'; $params[] = $id;
+
+    $sql = 'UPDATE vehicles SET ' . implode(',', $sets) . ' WHERE id=?';
     $stmt=$conn->prepare($sql);
     $stmt->bind_param($types, ...$params);
   }else{
     $status='available';
-    $cols = "plate_no,chassis_number,engine_number,maker,model,make_model,vehicle_type,seats,year,odometer,daily_rate,daily_rate_cdo,daily_rate_outside_cdo,transmission,comfort_level,fuel_type";
-    $vals = "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?";
-    $types = "sssssssiiddddsss";
-    $params = [$plate,$chassis,$engine,$maker,$model,$make_model,$type,$seats,$year,$odo,$daily_rate,$rate_cdo,$rate_outside,$trans,$comfort,$fuel];
+    $cols = [];
+    $vals = [];
+    $types = '';
+    $params = [];
+
+    $cols[] = 'plate_no'; $vals[] = '?'; $types .= 's'; $params[] = $plate;
+    if ($has_chassis) { $cols[] = 'chassis_number'; $vals[] = '?'; $types .= 's'; $params[] = $chassis; }
+    if ($has_engine) { $cols[] = 'engine_number'; $vals[] = '?'; $types .= 's'; $params[] = $engine; }
+    $cols[] = 'maker'; $vals[] = '?'; $types .= 's'; $params[] = $maker;
+    $cols[] = 'model'; $vals[] = '?'; $types .= 's'; $params[] = $model;
+    $cols[] = 'make_model'; $vals[] = '?'; $types .= 's'; $params[] = $make_model;
+    $cols[] = 'vehicle_type'; $vals[] = '?'; $types .= 's'; $params[] = $type;
+    $cols[] = 'seats'; $vals[] = '?'; $types .= 'i'; $params[] = $seats;
+    $cols[] = 'year'; $vals[] = '?'; $types .= 'i'; $params[] = $year;
+    $cols[] = 'odometer'; $vals[] = '?'; $types .= 'd'; $params[] = $odo;
+    $cols[] = 'daily_rate'; $vals[] = '?'; $types .= 'd'; $params[] = $daily_rate;
+    $cols[] = 'daily_rate_cdo'; $vals[] = '?'; $types .= 'd'; $params[] = $rate_cdo;
+    $cols[] = 'daily_rate_outside_cdo'; $vals[] = '?'; $types .= 'd'; $params[] = $rate_outside;
+    if ($has_promo_type) { $cols[] = 'promo_discount_type'; $vals[] = '?'; $types .= 's'; $params[] = $promo_discount_type; }
+    if ($has_promo_value) { $cols[] = 'promo_discount_value'; $vals[] = '?'; $types .= 'd'; $params[] = $promo_discount_value; }
+    if ($has_promo_starts) { $cols[] = 'promo_starts_at'; $vals[] = '?'; $types .= 's'; $params[] = $promo_starts_at; }
+    if ($has_promo_ends) { $cols[] = 'promo_ends_at'; $vals[] = '?'; $types .= 's'; $params[] = $promo_ends_at; }
+    $cols[] = 'transmission'; $vals[] = '?'; $types .= 's'; $params[] = $trans;
+    $cols[] = 'comfort_level'; $vals[] = '?'; $types .= 's'; $params[] = $comfort;
+    if ($has_listing) { $cols[] = 'listing_description'; $vals[] = '?'; $types .= 's'; $params[] = $listing_description; }
+    if ($has_fuel_type) { $cols[] = 'fuel_type'; $vals[] = '?'; $types .= 's'; $params[] = $fuel; }
+    if ($has_fuel_level) { $cols[] = 'fuel_level'; $vals[] = '?'; $types .= 's'; $params[] = $fuel_level; }
 
     if($has_ownership_type){
-      $cols .= ",ownership_type";
-      $vals .= ",?";
-      $types .= "s";
-      $params[] = $ownership_type;
+      $cols[] = 'ownership_type'; $vals[] = '?'; $types .= 's'; $params[] = $ownership_type;
     } elseif($has_classification){
-      $cols .= ",classification";
-      $vals .= ",?";
-      $types .= "s";
-      $params[] = $ownership_type;
+      $cols[] = 'classification'; $vals[] = '?'; $types .= 's'; $params[] = $ownership_type;
     }
 
     if($has_vehicle_condition){
-      $cols .= ",vehicle_condition";
-      $vals .= ",?";
-      $types .= "s";
-      $params[] = $vehicle_condition;
+      $cols[] = 'vehicle_condition'; $vals[] = '?'; $types .= 's'; $params[] = $vehicle_condition;
     } elseif($has_condition_status){
-      $cols .= ",condition_status";
-      $vals .= ",?";
-      $types .= "s";
-      $params[] = $vehicle_condition;
+      $cols[] = 'condition_status'; $vals[] = '?'; $types .= 's'; $params[] = $vehicle_condition;
     }
     if($has_category){
-      $cols .= ",category";
-      $vals .= ",?";
-      $types .= "s";
-      $params[] = ($category !== '' ? $category : null);
+      $cols[] = 'category'; $vals[] = '?'; $types .= 's'; $params[] = ($category !== '' ? $category : null);
     }
-    $cols .= ",current_status,photo";
-    $vals .= ",?,?";
-    $types .= "ss";
-    $params[] = $status;
-    $params[] = $photo;
-    $stmt=$conn->prepare("INSERT INTO vehicles($cols) VALUES($vals)");
+    if($has_max_capacity_kg){
+      $cols[] = 'max_capacity_kg'; $vals[] = '?'; $types .= 's';
+      $params[] = ($max_capacity_kg === null ? null : number_format($max_capacity_kg, 2, '.', ''));
+    }
+
+    $cols[] = 'current_status'; $vals[] = '?'; $types .= 's'; $params[] = $status;
+    $cols[] = 'photo'; $vals[] = '?'; $types .= 's'; $params[] = $photo;
+
+    $stmt=$conn->prepare('INSERT INTO vehicles('.implode(',', $cols).') VALUES('.implode(',', $vals).')');
     $stmt->bind_param($types, ...$params);
   }
   
@@ -475,31 +684,62 @@ h1::before{content:'';}
 .actions .btn{flex:1;display:flex;align-items:center;justify-content:center;gap:6px;padding:10px 16px;font-size:.85rem;transition:all .2s ease;}
 .actions .btn:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,.3);}
 .btn-icon{font-size:1rem;}
-.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.8);backdrop-filter:blur(16px);visibility:hidden;opacity:0;transition:all .4s cubic-bezier(0.4,0,0.2,1);z-index:1000;padding:20px;}
+.modal-bg{
+  position:fixed;inset:0;
+  background:rgba(0,0,0,.8);backdrop-filter:blur(16px);
+  visibility:hidden;opacity:0;
+  transition:all .4s cubic-bezier(0.4,0,0.2,1);
+  z-index:10050;
+  padding:24px 16px;
+  display:flex;align-items:center;justify-content:center;
+  overflow-y:auto;overscroll-behavior:contain;
+}
 .modal-bg.open{visibility:visible;opacity:1;}
-.modal{background:linear-gradient(145deg,#0f141a,#1a1f2e);border:1px solid rgba(93,208,255,.2);border-radius:24px;
- width:min(800px,94vw);max-height:90vh;overflow-y:auto;box-shadow:0 25px 50px rgba(0,0,0,.6),0 0 0 1px rgba(93,208,255,.1);position:relative;transform:scale(.9) translateY(20px);transition:all .4s cubic-bezier(0.4,0,0.2,1);}
+.modal{
+  background:linear-gradient(145deg,#0f141a,#1a1f2e);
+  border:1px solid rgba(93,208,255,.2);border-radius:24px;
+  width:min(920px,96vw);max-height:min(92vh,980px);
+  overflow-y:auto;overflow-x:hidden;
+  box-shadow:0 25px 50px rgba(0,0,0,.6),0 0 0 1px rgba(93,208,255,.1);
+  position:relative;margin:auto;flex-shrink:0;
+  transform:scale(.96) translateY(12px);
+  transition:transform .35s cubic-bezier(0.4,0,0.2,1), opacity .35s ease;
+  scrollbar-width:thin;
+  scrollbar-color:rgba(255,255,255,.28) transparent;
+}
+.modal::-webkit-scrollbar{width:8px}
+.modal::-webkit-scrollbar-track{background:transparent}
+.modal::-webkit-scrollbar-thumb{background:rgba(255,255,255,.28);border-radius:8px}
+.modal::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.4)}
 .modal-bg.open .modal{transform:scale(1) translateY(0);}
 .modal::before{content:'';position:absolute;top:0;left:0;right:0;height:4px;background:linear-gradient(90deg,var(--brand),var(--brand2));border-radius:24px 24px 0 0;}
 .modal::after{content:'';position:absolute;inset:0;border-radius:24px;background:linear-gradient(145deg,rgba(93,208,255,.05),transparent);pointer-events:none;}
-.modal-header{display:flex;justify-content:space-between;align-items:center;padding:32px 32px 0;margin-bottom:8px;position:relative;z-index:1;}
+.modal-header{display:flex;justify-content:space-between;align-items:center;padding:28px 28px 0;margin-bottom:8px;position:relative;z-index:1;}
 .modal h2{margin:0;font-weight:800;font-size:1.75rem;color:var(--text);display:flex;align-items:center;gap:12px;letter-spacing:-.02em;}
 .modal h2::before{content:'';}
 .modal-close{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);color:var(--muted);font-size:1.25rem;cursor:pointer;padding:8px;border-radius:8px;transition:all .3s ease;width:36px;height:36px;display:flex;align-items:center;justify-content:center;}
 .modal-close:hover{background:rgba(255,255,255,.1);color:var(--text);transform:scale(1.05);border-color:var(--brand);}
-.modal form{padding:0 32px 32px;position:relative;z-index:1;}
-.modal-section{margin-bottom:32px;background:rgba(255,255,255,.02);border-radius:16px;padding:24px;border:1px solid rgba(255,255,255,.05);transition:all .3s ease;}
+.modal form{padding:0 28px 28px;position:relative;z-index:1;}
+.modal-section{margin-bottom:20px;background:rgba(255,255,255,.02);border-radius:16px;padding:20px;border:1px solid rgba(255,255,255,.05);transition:all .3s ease;}
 .modal-section:hover{background:rgba(255,255,255,.03);border-color:rgba(93,208,255,.1);}
-.modal-section-title{font-weight:700;color:var(--text);margin-bottom:20px;font-size:1.1rem;display:flex;align-items:center;gap:10px;letter-spacing:-.01em;}
+.modal-section-title{font-weight:700;color:var(--text);margin-bottom:16px;font-size:1.05rem;display:flex;align-items:center;gap:10px;letter-spacing:-.01em;}
 .modal-section-title::before{content:'▸';color:var(--brand);font-size:1.2rem;transition:transform .3s ease;}
 .modal-section:hover .modal-section-title::before{transform:translateX(2px);}
-.modal-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:20px;}
+.modal-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px 18px;}
+@media (max-width:640px){
+  .modal-grid{grid-template-columns:1fr}
+  .modal-header,.modal form{padding-left:18px;padding-right:18px}
+  .modal-section{padding:16px}
+}
 label{display:block;margin:12px 0 6px;font-weight:600;color:var(--text);font-size:.95rem;letter-spacing:-.01em;}
-input,select{width:100%;padding:14px 18px;border-radius:12px;border:1px solid rgba(255,255,255,.15);
- background:rgba(13,17,22,.8);color:var(--text);outline:none;font-size:.95rem;transition:all .3s ease;font-weight:500;}
-input:focus,select:focus{border-color:var(--brand);box-shadow:0 0 0 4px rgba(93,208,255,.2),0 0 20px rgba(93,208,255,.1);background:rgba(13,17,22,.95);}
-input:hover,select:hover{border-color:rgba(93,208,255,.3);background:rgba(13,17,22,.9);}
-.modal-actions{display:flex;gap:16px;justify-content:flex-end;padding-top:32px;border-top:1px solid rgba(255,255,255,.08);margin-top:32px;}
+.form-field label{margin:0 0 8px}
+.form-field{position:relative;min-width:0}
+input,select,textarea{width:100%;padding:14px 18px;border-radius:12px;border:1px solid rgba(255,255,255,.15);
+ background:rgba(13,17,22,.8);color:var(--text);outline:none;font-size:.95rem;transition:all .3s ease;font-weight:500;font-family:inherit;}
+input:focus,select:focus,textarea:focus{border-color:var(--brand);box-shadow:0 0 0 4px rgba(93,208,255,.2),0 0 20px rgba(93,208,255,.1);background:rgba(13,17,22,.95);}
+input:hover,select:hover,textarea:hover{border-color:rgba(93,208,255,.3);background:rgba(13,17,22,.9);}
+textarea{min-height:96px;resize:vertical;}
+.modal-actions{display:flex;gap:16px;justify-content:flex-end;flex-wrap:wrap;padding-top:24px;border-top:1px solid rgba(255,255,255,.08);margin-top:24px;}
 .validation-error{color:#ff6b6b;font-size:.85rem;margin-top:6px;display:none;padding:8px 12px;background:rgba(255,107,107,.1);border:1px solid rgba(255,107,107,.2);border-radius:8px;font-weight:500;animation:shake .5s ease;}
 .validation-error.show{display:block;}
 .loading-spinner{display:none;width:20px;height:20px;border:2px solid rgba(255,255,255,.2);border-top:2px solid var(--brand);border-radius:50%;animation:spin 1s linear infinite;filter:drop-shadow(0 0 4px rgba(93,208,255,.5));}
@@ -517,7 +757,6 @@ input.success,select.success{border-color:#00ff88;background:rgba(0,255,136,.05)
 .floating-label select:focus ~ label{transform:translateY(-25px) scale(.85);color:var(--brand);}
 
 /* Form field enhancements */
-.form-field{position:relative;}
 .form-field label::after{content:'';position:absolute;bottom:-2px;left:0;width:0;height:2px;background:var(--brand);transition:width .3s ease;}
 .form-field:focus-within label::after{width:100%;}
 
@@ -810,6 +1049,11 @@ input.success,select.success{border-color:#00ff88;background:rgba(0,255,136,.05)
               <option value="15">15</option>
             </select>
           </div>
+          <div class="form-field">
+            <label>Maximum Capacity (KG)</label>
+            <input type="number" name="max_capacity_kg" id="f_max_capacity_kg" min="1" step="1" placeholder="e.g. 500">
+            <small style="display:block;margin-top:6px;color:var(--muted);font-weight:600;">Total passenger/load weight capacity (e.g. Vios ≈ 500 KG)</small>
+          </div>
         </div>
       </div>
       
@@ -859,6 +1103,18 @@ input.success,select.success{border-color:#00ff88;background:rgba(0,255,136,.05)
             <option value="Electric">Electric</option>
             </select>
           </div>
+          <div class="form-field">
+            <label>Fuel Level</label>
+            <select name="fuel_level" id="f_fuel_level">
+              <option value="">Select Fuel Level</option>
+              <option value="full">Full</option>
+              <option value="3/4">3/4 Tank</option>
+              <option value="half">Half Tank</option>
+              <option value="1/4">1/4 Tank</option>
+              <option value="empty">Empty</option>
+            </select>
+            <small style="display:block;margin-top:6px;color:var(--muted);font-weight:600;">Auto-updates from the latest vehicle return</small>
+          </div>
         </div>
       </div>
       
@@ -873,6 +1129,45 @@ input.success,select.success{border-color:#00ff88;background:rgba(0,255,136,.05)
             <label>Daily Rate - Outside CDO (₱)</label>
             <input name="daily_rate_outside_cdo" id="f_rate_outside" type="number" min="0" step="50" required placeholder="Enter outside CDO rate">
           </div>
+          <div class="form-field">
+            <label>Promo Discount Type</label>
+            <select name="promo_discount_type" id="f_promo_type">
+              <option value="none">None</option>
+              <option value="percent">Percentage (%)</option>
+              <option value="fixed">Fixed amount (₱ / day)</option>
+            </select>
+          </div>
+          <div class="form-field">
+            <label id="f_promo_value_label">Promo Discount Value</label>
+            <input name="promo_discount_value" id="f_promo_value" type="number" min="0" step="0.01" value="0" placeholder="0">
+            <div class="field-hint" id="f_promo_hint" style="margin-top:6px;font-size:.8rem;font-weight:600;color:var(--muted);">Leave as None / 0 for no vehicle promo.</div>
+          </div>
+          <div class="form-field promo-schedule-field">
+            <label>Promo Start Date</label>
+            <input type="date" name="promo_start_date" id="f_promo_start_date">
+          </div>
+          <div class="form-field promo-schedule-field">
+            <label>Promo Start Time</label>
+            <input type="time" name="promo_start_time" id="f_promo_start_time" value="00:00">
+          </div>
+          <div class="form-field promo-schedule-field">
+            <label>Promo End Date</label>
+            <input type="date" name="promo_end_date" id="f_promo_end_date">
+          </div>
+          <div class="form-field promo-schedule-field">
+            <label>Promo End Time</label>
+            <input type="time" name="promo_end_time" id="f_promo_end_time" value="23:59">
+            <div class="field-hint" style="margin-top:6px;font-size:.8rem;font-weight:600;color:var(--muted);">Promo only applies between start and end (inclusive).</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="modal-section">
+        <div class="modal-section-title">Listing description</div>
+        <div class="form-field">
+          <label for="f_listing">Shown to customers on Browse Cars</label>
+          <textarea name="listing_description" id="f_listing" maxlength="2000" placeholder="A short description of this vehicle"></textarea>
+          <button class="btn btn-dark" type="button" id="btnGeminiDesc" style="margin-top:10px;">Write with Gemini</button>
         </div>
       </div>
       
@@ -987,7 +1282,13 @@ const saveText=document.getElementById('saveText');
 const filtersToggle=document.getElementById('filtersToggle');
 const filtersContent=document.getElementById('filtersContent');
 
-function openModal(){modalBg.classList.add('open');document.body.style.overflow='hidden';}
+function openModal(){
+  if (modalBg && modalBg.parentElement !== document.body) {
+    document.body.appendChild(modalBg);
+  }
+  modalBg.classList.add('open');
+  document.body.style.overflow='hidden';
+}
 function closeModal(){modalBg.classList.remove('open');document.body.style.overflow='auto';}
 
 // Filter toggle functionality
@@ -1196,6 +1497,29 @@ function validateForm() {
     alert('Please fill in all required fields.');
     return false;
   }
+
+  const promoType = document.getElementById('f_promo_type')?.value || 'none';
+  if (promoType === 'percent' || promoType === 'fixed') {
+    const promoVal = parseFloat(document.getElementById('f_promo_value')?.value || '0');
+    const sd = document.getElementById('f_promo_start_date')?.value || '';
+    const st = document.getElementById('f_promo_start_time')?.value || '00:00';
+    const ed = document.getElementById('f_promo_end_date')?.value || '';
+    const et = document.getElementById('f_promo_end_time')?.value || '23:59';
+    if (!(promoVal > 0)) {
+      alert('Enter a promo discount value greater than 0, or set Promo Type to None.');
+      return false;
+    }
+    if (!sd || !ed) {
+      alert('Please set the promo start and end date/time.');
+      return false;
+    }
+    const start = new Date(`${sd}T${st || '00:00'}`);
+    const end = new Date(`${ed}T${et || '23:59'}`);
+    if (isNaN(start.getTime()) || isNaN(end.getTime()) || end <= start) {
+      alert('Promo end date/time must be after the start date/time.');
+      return false;
+    }
+  }
   return true;
 }
 
@@ -1348,13 +1672,23 @@ function loadVehicleData(vehicleId) {
         document.getElementById('f_category').value = v.category || '';
       }
       document.getElementById('f_seats').value = v.seats || '';
+      if (document.getElementById('f_max_capacity_kg')) {
+        document.getElementById('f_max_capacity_kg').value = (v.max_capacity_kg !== null && v.max_capacity_kg !== undefined && v.max_capacity_kg !== '') ? v.max_capacity_kg : '';
+      }
       document.getElementById('f_year').value = v.year || '';
       document.getElementById('f_odo').value = v.odometer || '';
       document.getElementById('f_trans').value = v.transmission || '';
       document.getElementById('f_comfort').value = v.comfort_level || '';
       document.getElementById('f_fuel').value = v.fuel_type || '';
+      if (document.getElementById('f_fuel_level')) {
+        document.getElementById('f_fuel_level').value = v.fuel_level || '';
+      }
       document.getElementById('f_rate_cdo').value = v.daily_rate_cdo || '';
       document.getElementById('f_rate_outside').value = v.daily_rate_outside_cdo || '';
+      if (document.getElementById('f_listing')) {
+        document.getElementById('f_listing').value = v.listing_description || '';
+      }
+      setPromoDiscountFields(v.promo_discount_type, v.promo_discount_value, v.promo_starts_at, v.promo_ends_at);
       
       // Show current photo if exists
       if (v.photo) {
@@ -1381,6 +1715,7 @@ btnAdd.onclick=()=>{
   modalTitle.style.color = 'var(--brand)';
   document.getElementById('vehForm').reset();
   f_id.value='';
+  setPromoDiscountFields('none', 0, '', '');
   
   // Reset photo section
   const previewContainer = document.getElementById('previewContainer');
@@ -1396,6 +1731,51 @@ btnAdd.onclick=()=>{
   if (removeBtn) removeBtn.style.display = 'none';
   
   openModal();
+}
+
+const btnGeminiDesc = document.getElementById('btnGeminiDesc');
+if (btnGeminiDesc) {
+  btnGeminiDesc.addEventListener('click', async function () {
+    const field = document.getElementById('f_listing');
+    const original = btnGeminiDesc.textContent;
+    btnGeminiDesc.disabled = true;
+    btnGeminiDesc.textContent = 'Writing…';
+    try {
+      const res = await fetch('includes/ajax_gemini.php', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({
+          action: 'vehicle_description',
+          vehicle: {
+            maker: document.getElementById('f_maker').value,
+            model: document.getElementById('f_model').value,
+            type: document.getElementById('f_type').value,
+            year: document.getElementById('f_year').value,
+            seats: document.getElementById('f_seats').value,
+            transmission: document.getElementById('f_trans').value,
+            comfort: document.getElementById('f_comfort').value,
+            fuel: document.getElementById('f_fuel').value,
+            category: document.getElementById('f_category') ? document.getElementById('f_category').value : '',
+            condition: document.getElementById('f_vehicle_condition').value,
+            daily_rate_cdo: document.getElementById('f_rate_cdo').value,
+            daily_rate_outside_cdo: document.getElementById('f_rate_outside').value
+          }
+        })
+      });
+      const data = await res.json();
+      if (data && data.ok) {
+        field.value = data.text;
+      } else {
+        alert((data && data.error) || 'Could not write a description.');
+      }
+    } catch (err) {
+      alert('Could not reach Gemini.');
+    } finally {
+      btnGeminiDesc.disabled = false;
+      btnGeminiDesc.textContent = original;
+    }
+  });
 }
 
 btnCancel.onclick=closeModal;
@@ -1420,6 +1800,93 @@ document.getElementById('f_rate_cdo').addEventListener('input', function() {
     document.getElementById('f_rate_outside').value = outsideRate;
   }
 });
+
+function splitDateTime(dt){
+  if (!dt) return { date: '', time: '' };
+  const s = String(dt).replace('T', ' ').trim();
+  const parts = s.split(' ');
+  const date = (parts[0] || '').slice(0, 10);
+  let time = (parts[1] || '').slice(0, 5);
+  if (time && time.length === 4) time = '0' + time;
+  return { date, time };
+}
+
+function syncPromoDiscountUI(){
+  const typeEl = document.getElementById('f_promo_type');
+  const valueEl = document.getElementById('f_promo_value');
+  const labelEl = document.getElementById('f_promo_value_label');
+  const hintEl = document.getElementById('f_promo_hint');
+  const scheduleFields = document.querySelectorAll('.promo-schedule-field input');
+  if (!typeEl || !valueEl) return;
+  const t = typeEl.value || 'none';
+  const enabled = t === 'percent' || t === 'fixed';
+
+  scheduleFields.forEach(el => {
+    el.disabled = !enabled;
+    el.required = enabled;
+  });
+
+  if (t === 'percent') {
+    valueEl.disabled = false;
+    valueEl.max = '100';
+    valueEl.step = '0.01';
+    valueEl.placeholder = 'e.g. 10';
+    if (labelEl) labelEl.textContent = 'Promo Discount (%)';
+    if (hintEl) hintEl.textContent = 'Percent off the daily rate (max 100%).';
+  } else if (t === 'fixed') {
+    valueEl.disabled = false;
+    valueEl.removeAttribute('max');
+    valueEl.step = '1';
+    valueEl.placeholder = 'e.g. 200';
+    if (labelEl) labelEl.textContent = 'Promo Discount (₱ / day)';
+    if (hintEl) hintEl.textContent = 'Fixed peso amount deducted from the daily rate.';
+  } else {
+    valueEl.disabled = true;
+    valueEl.value = '0';
+    valueEl.removeAttribute('max');
+    valueEl.placeholder = '0';
+    if (labelEl) labelEl.textContent = 'Promo Discount Value';
+    if (hintEl) hintEl.textContent = 'Leave as None / 0 for no vehicle promo.';
+    const sd = document.getElementById('f_promo_start_date');
+    const st = document.getElementById('f_promo_start_time');
+    const ed = document.getElementById('f_promo_end_date');
+    const et = document.getElementById('f_promo_end_time');
+    if (sd) sd.value = '';
+    if (st) st.value = '00:00';
+    if (ed) ed.value = '';
+    if (et) et.value = '23:59';
+  }
+}
+
+function setPromoDiscountFields(type, value, startsAt, endsAt){
+  const typeEl = document.getElementById('f_promo_type');
+  const valueEl = document.getElementById('f_promo_value');
+  if (!typeEl || !valueEl) return;
+  let t = String(type || 'none').toLowerCase();
+  if (!['none','percent','fixed'].includes(t)) t = 'none';
+  const v = parseFloat(value);
+  typeEl.value = t;
+  valueEl.value = (!isFinite(v) || v < 0) ? '0' : String(v);
+
+  const start = splitDateTime(startsAt);
+  const end = splitDateTime(endsAt);
+  const sd = document.getElementById('f_promo_start_date');
+  const st = document.getElementById('f_promo_start_time');
+  const ed = document.getElementById('f_promo_end_date');
+  const et = document.getElementById('f_promo_end_time');
+  if (sd) sd.value = start.date || '';
+  if (st) st.value = start.time || '00:00';
+  if (ed) ed.value = end.date || '';
+  if (et) et.value = end.time || '23:59';
+
+  syncPromoDiscountUI();
+}
+
+const promoTypeEl = document.getElementById('f_promo_type');
+if (promoTypeEl) {
+  promoTypeEl.addEventListener('change', syncPromoDiscountUI);
+  syncPromoDiscountUI();
+}
 
 // Filter event listeners (search removed)
 document.getElementById('statusFilter').addEventListener('change', filterVehicles);
@@ -1519,6 +1986,9 @@ document.querySelectorAll('.btn-edit').forEach(btn=>{
           }
         }
       }
+      if (document.getElementById('f_max_capacity_kg')) {
+        document.getElementById('f_max_capacity_kg').value = (v.max_capacity_kg !== null && v.max_capacity_kg !== undefined && v.max_capacity_kg !== '') ? v.max_capacity_kg : '';
+      }
       
       const yearSelect = document.getElementById('f_year');
       if (v.year) {
@@ -1533,6 +2003,10 @@ document.querySelectorAll('.btn-edit').forEach(btn=>{
       document.getElementById('f_odo').value=v.odometer||0;
       document.getElementById('f_rate_cdo').value=v.daily_rate_cdo||v.daily_rate||0;
       document.getElementById('f_rate_outside').value=v.daily_rate_outside_cdo||0;
+      if (document.getElementById('f_listing')) {
+        document.getElementById('f_listing').value = v.listing_description || '';
+      }
+      setPromoDiscountFields(v.promo_discount_type, v.promo_discount_value, v.promo_starts_at, v.promo_ends_at);
       
       const transSelect = document.getElementById('f_trans');
       console.log('Transmission value from DB:', v.transmission);
@@ -1592,7 +2066,7 @@ function quickView(vehicleId) {
       if (!v.id) return alert('Vehicle not found');
 
       const photoUrl = v.photo ? ('assets/vehicles/' + v.photo) : null;
-      const fallback = (v.vehicle_type && String(v.vehicle_type).toLowerCase().includes('suv')) ? 'assets/vehicles/suv.jpg' : 'assets/vehicles/sedan.jpg';
+      const fallback = 'assets/vehicles/images.jpeg';
       const imgUrl = photoUrl || fallback;
       
       const content = `
@@ -1634,6 +2108,22 @@ function quickView(vehicleId) {
                 <span style="color:var(--text);font-weight:600;">${v.seats}</span>
               </div>
               <div style="display:flex;justify-content:space-between;">
+                <span style="color:var(--muted);">Max Capacity:</span>
+                <span style="color:var(--text);font-weight:600;">${v.max_capacity_kg ? (Number(v.max_capacity_kg).toLocaleString() + ' KG') : '—'}</span>
+              </div>
+              <div style="display:flex;justify-content:space-between;">
+                <span style="color:var(--muted);">Fuel Level:</span>
+                <span style="color:var(--text);font-weight:600;">${(() => {
+                  const fl = String(v.fuel_level || '').toLowerCase();
+                  if (fl === 'full') return 'Full';
+                  if (fl === '3/4') return '3/4 Tank';
+                  if (fl === 'half') return 'Half Tank';
+                  if (fl === '1/4') return '1/4 Tank';
+                  if (fl === 'empty') return 'Empty';
+                  return fl || '—';
+                })()}</span>
+              </div>
+              <div style="display:flex;justify-content:space-between;">
                 <span style="color:var(--muted);">Transmission:</span>
                 <span style="color:var(--text);font-weight:600;">${v.transmission}</span>
               </div>
@@ -1653,6 +2143,39 @@ function quickView(vehicleId) {
                 <span style="color:var(--muted);">Daily Rate (Outside):</span>
                 <span style="color:var(--brand2);font-weight:700;">₱${(v.daily_rate_outside_cdo || (v.daily_rate_cdo || v.daily_rate || 0) * 1.2).toLocaleString()}</span>
               </div>
+              ${(() => {
+                const pt = String(v.promo_discount_type || 'none').toLowerCase();
+                const pv = Number(v.promo_discount_value || 0);
+                if (!pv || pt === 'none') {
+                  return `<div style="display:flex;justify-content:space-between;">
+                    <span style="color:var(--muted);">Promo Discount:</span>
+                    <span style="color:var(--text);font-weight:600;">None</span>
+                  </div>`;
+                }
+                const label = pt === 'percent'
+                  ? `${pv}% off`
+                  : `₱${pv.toLocaleString(undefined,{minimumFractionDigits:2})} / day`;
+                const fmt = (dt) => {
+                  if (!dt) return '—';
+                  const d = new Date(String(dt).replace(' ', 'T'));
+                  if (isNaN(d.getTime())) return String(dt);
+                  return d.toLocaleString();
+                };
+                const start = fmt(v.promo_starts_at);
+                const end = fmt(v.promo_ends_at);
+                const now = Date.now();
+                const s = v.promo_starts_at ? new Date(String(v.promo_starts_at).replace(' ', 'T')).getTime() : NaN;
+                const e = v.promo_ends_at ? new Date(String(v.promo_ends_at).replace(' ', 'T')).getTime() : NaN;
+                const active = !isNaN(s) && !isNaN(e) && now >= s && now <= e;
+                return `<div style="display:flex;justify-content:space-between;gap:12px;">
+                  <span style="color:var(--muted);">Promo Discount:</span>
+                  <span style="color:var(--brand2);font-weight:700;text-align:right;">${label}${active ? ' · Active' : ' · Scheduled'}</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;gap:12px;">
+                  <span style="color:var(--muted);">Promo Window:</span>
+                  <span style="color:var(--text);font-weight:600;text-align:right;font-size:.9rem;">${start} → ${end}</span>
+                </div>`;
+              })()}
               <div style="display:flex;justify-content:space-between;">
                 <span style="color:var(--muted);">Status:</span>
                 <span class="badge ${v.current_status === 'available' ? 'green' : (v.current_status === 'rented' ? 'yellow' : 'red')}">${v.current_status}</span>
@@ -1669,7 +2192,9 @@ function quickView(vehicleId) {
         const editBtn = document.querySelector(`.btn-edit[data-id="${vehicleId}"]`);
         if (editBtn) editBtn.click();
       };
-      document.getElementById('quickViewModal').classList.add('open');
+      const qv = document.getElementById('quickViewModal');
+      if (qv && qv.parentElement !== document.body) document.body.appendChild(qv);
+      qv.classList.add('open');
       document.body.style.overflow = 'hidden';
     });
 }

@@ -27,16 +27,32 @@ if (isset($_GET['ajax'])) {
     try {
         switch ($_GET['ajax']) {
             case 'kpi_data':
+                $totalVehiclesAjax = (int)scalar($conn,"SELECT COUNT(*) FROM vehicles");
+                $activeRentalsAjax = (int)scalar($conn,"SELECT COUNT(*) FROM rentals WHERE LOWER(COALESCE(status,'')) IN('pending','reserved','ongoing')");
+                $ongoingAjax = (int)scalar($conn,"SELECT COUNT(*) FROM rentals WHERE LOWER(COALESCE(status,''))='ongoing'");
                 $kpiData = [
-                    'totalVehicles' => (int)scalar($conn,"SELECT COUNT(*) FROM vehicles"),
+                    'totalVehicles' => $totalVehiclesAjax,
                     'availableToday' => (int)scalar($conn,"SELECT COUNT(*) FROM vehicles WHERE current_status='available'"),
-                    'activeRentals' => (int)scalar($conn,"SELECT COUNT(*) FROM rentals WHERE status IN('pending','reserved','ongoing')"),
-                    'maintDue' => (int)scalar($conn,"SELECT COUNT(*) FROM maintenance WHERE status IN('scheduled','in_progress') AND schedule_date=CURDATE()"),
+                    'activeRentals' => $activeRentalsAjax,
+                    'ongoingRentals' => $ongoingAjax,
+                    'newBookings' => (int)scalar($conn,"SELECT COUNT(*) FROM rentals WHERE LOWER(COALESCE(status,'')) IN('pending','reserved')"),
+                    'newBookingsToday' => (int)scalar($conn,"SELECT COUNT(*) FROM rentals WHERE DATE(created_at)=CURDATE() AND LOWER(COALESCE(status,'')) NOT IN('cancelled')"),
+                    'nearReturn' => (int)scalar($conn,"SELECT COUNT(*) FROM rentals WHERE LOWER(COALESCE(status,''))='ongoing' AND end_date BETWEEN CURDATE() AND DATE_ADD(CURDATE(), INTERVAL 3 DAY)"),
+                    'overdueRentals' => (int)scalar($conn,"SELECT COUNT(*) FROM rentals WHERE LOWER(COALESCE(status,''))='ongoing' AND end_date < CURDATE()"),
+                    'openMaintenance' => (int)scalar($conn,"SELECT COUNT(*) FROM maintenance WHERE LOWER(COALESCE(status,'')) IN('scheduled','in_progress','pending')"),
+                    'maintDue' => (int)scalar($conn,"SELECT COUNT(*) FROM maintenance WHERE LOWER(COALESCE(status,'')) IN('scheduled','in_progress','pending') AND schedule_date=CURDATE()"),
+                    'vehiclesNeedMaint' => (int)scalar($conn,"
+                        SELECT COUNT(DISTINCT v.id) FROM vehicles v
+                        LEFT JOIN maintenance m ON m.vehicle_id=v.id
+                          AND LOWER(COALESCE(m.status,'')) IN('scheduled','in_progress','pending')
+                          AND m.schedule_date <= DATE_ADD(CURDATE(), INTERVAL 7 DAY)
+                        WHERE LOWER(COALESCE(v.current_status,'')) IN('maintenance','scheduled_maintenance','inspection','unavailable')
+                           OR m.id IS NOT NULL
+                    "),
                     'todayRevenue' => (float)scalar($conn,"SELECT COALESCE(SUM(total_cost), 0) FROM rentals WHERE DATE(created_at) = CURDATE() AND status = 'completed'"),
                     'monthlyRevenue' => (float)scalar($conn,"SELECT COALESCE(SUM(total_cost), 0) FROM rentals WHERE MONTH(created_at) = MONTH(CURDATE()) AND YEAR(created_at) = YEAR(CURDATE()) AND status = 'completed'"),
-                    'utilizationRate' => $totalVehicles > 0 ? round(($activeRentals / $totalVehicles) * 100, 1) : 0,
+                    'utilizationRate' => $totalVehiclesAjax > 0 ? round(($ongoingAjax / $totalVehiclesAjax) * 100, 1) : 0,
                     'urgentMaintenance' => (int)scalar($conn,"SELECT COUNT(*) FROM maintenance WHERE status = 'scheduled' AND schedule_date <= CURDATE()"),
-                    'overdueRentals' => (int)scalar($conn,"SELECT COUNT(*) FROM rentals WHERE status = 'ongoing' AND end_date < CURDATE()"),
                     'pendingApprovals' => (int)scalar($conn,"SELECT COUNT(*) FROM users WHERE profile_status = 'pending_approval'"),
                     'timestamp' => time()
                 ];
@@ -127,6 +143,242 @@ if (isset($_GET['ajax'])) {
                 ];
                 
                 echo json_encode(['success' => true, 'data' => $forecastData]);
+                break;
+
+            case 'kpi_details':
+                $type = strtolower(trim((string)($_GET['type'] ?? '')));
+                $titles = [
+                    'active_rentals' => 'Active Rentals',
+                    'new_bookings' => 'New Bookings',
+                    'fleet_status' => 'Fleet Status',
+                    'open_maintenance' => 'Open Maintenance',
+                    'needs_maintenance' => 'Vehicles Needing Maintenance',
+                    'near_return' => 'Cars Near Return',
+                    'overdue_returns' => 'Exceeded Rental Period',
+                ];
+                if (!isset($titles[$type])) {
+                    echo json_encode(['success' => false, 'error' => 'Unknown KPI type']);
+                    break;
+                }
+
+                $rows = [];
+                $columns = [];
+                $pageLink = 'dashboard.php';
+
+                if ($type === 'active_rentals' || $type === 'new_bookings' || $type === 'near_return' || $type === 'overdue_returns') {
+                    $columns = ['Customer', 'Vehicle', 'Plate', 'Dates', 'Status'];
+                    $pageLink = 'rentals_all.php';
+                    if ($type === 'active_rentals') {
+                        $where = "LOWER(COALESCE(r.status,'')) IN ('pending','reserved','ongoing')";
+                        $order = "FIELD(LOWER(COALESCE(r.status,'')),'ongoing','reserved','pending'), r.end_date ASC";
+                    } elseif ($type === 'new_bookings') {
+                        $where = "LOWER(COALESCE(r.status,'')) IN ('pending','reserved')";
+                        $order = "r.created_at DESC";
+                    } elseif ($type === 'overdue_returns') {
+                        $where = "LOWER(COALESCE(r.status,'')) = 'ongoing'
+                                  AND TIMESTAMP(r.end_date, COALESCE(NULLIF(r.end_time,'') , '23:59:59')) < NOW()";
+                        $order = "TIMESTAMP(r.end_date, COALESCE(NULLIF(r.end_time,''), '23:59:59')) ASC";
+                        $columns = ['Customer', 'Vehicle', 'Plate', 'Due Date', 'Days Overdue'];
+                    } else {
+                        $where = "LOWER(COALESCE(r.status,'')) = 'ongoing'
+                                  AND r.end_date BETWEEN CURDATE() AND DATE_ADD(CURDATE(), INTERVAL 3 DAY)
+                                  AND TIMESTAMP(r.end_date, COALESCE(NULLIF(r.end_time,''), '23:59:59')) >= NOW()";
+                        $order = "r.end_date ASC";
+                        $columns = ['Customer', 'Vehicle', 'Plate', 'Return Date', 'Status'];
+                    }
+                    $sql = "
+                        SELECT r.id, r.start_date, r.start_time, r.end_date, r.end_time, r.status, r.created_at,
+                               r.daily_rate, r.applied_rate, r.total_cost, r.balance_due, r.rate_type,
+                               r.penalty_per_hour, r.total_days,
+                               COALESCE(u.full_name, CONCAT('User #', r.customer_id)) AS customer_name,
+                               u.email AS customer_email, COALESCE(u.contact_no, u.phone) AS customer_phone,
+                               v.make_model, v.plate_no, v.vehicle_type,
+                               DATEDIFF(CURDATE(), r.end_date) AS days_overdue,
+                               TIMESTAMPDIFF(
+                                 SECOND,
+                                 TIMESTAMP(r.end_date, COALESCE(NULLIF(r.end_time,''), '23:59:59')),
+                                 NOW()
+                               ) AS seconds_overdue
+                        FROM rentals r
+                        LEFT JOIN users u ON u.id = r.customer_id
+                        LEFT JOIN vehicles v ON v.id = r.vehicle_id
+                        WHERE $where
+                        ORDER BY $order
+                        LIMIT 50
+                    ";
+                    $res = $conn->query($sql);
+                    if ($res) {
+                        while ($row = $res->fetch_assoc()) {
+                            $status = strtolower((string)($row['status'] ?? ''));
+                            $end = (string)($row['end_date'] ?? '');
+                            $daysOver = max(0, (int)($row['days_overdue'] ?? 0));
+                            if ($type === 'overdue_returns') {
+                                $secondsOver = max(0, (int)($row['seconds_overdue'] ?? 0));
+                                $hoursOver = (int)ceil($secondsOver / 3600);
+                                if ($hoursOver < 1 && $secondsOver > 0) $hoursOver = 1;
+                                $ratePerHour = 100.0; // fixed overcharge: ₱100 / overdue hour
+                                $overcharge = $hoursOver * $ratePerHour;
+                                $startTime = substr((string)($row['start_time'] ?? '00:00:00'), 0, 5);
+                                $endTime = substr((string)($row['end_time'] ?? '23:59:59'), 0, 5);
+                                $dueLabel = $end
+                                    ? date('M j, Y', strtotime($end)) . ' ' . $endTime
+                                    : '—';
+                                $rows[] = [
+                                    'id' => (int)$row['id'],
+                                    'expandable' => true,
+                                    'cells' => [
+                                        $row['customer_name'] ?? '—',
+                                        $row['make_model'] ?? '—',
+                                        $row['plate_no'] ?? '—',
+                                        $dueLabel,
+                                        $daysOver . ' day' . ($daysOver === 1 ? '' : 's'),
+                                    ],
+                                    'detail' => [
+                                        'Rental ID' => '#' . (int)$row['id'],
+                                        'Customer' => $row['customer_name'] ?? '—',
+                                        'Email' => $row['customer_email'] ?: '—',
+                                        'Phone' => $row['customer_phone'] ?: '—',
+                                        'Vehicle' => trim(($row['make_model'] ?? '') . ' · ' . ($row['plate_no'] ?? '')),
+                                        'Type' => $row['vehicle_type'] ?? '—',
+                                        'Rental Period' => trim(
+                                            date('M j, Y', strtotime($row['start_date'] ?? 'now')) . ' ' . $startTime
+                                            . ' → '
+                                            . date('M j, Y', strtotime($end ?: 'now')) . ' ' . $endTime
+                                        ),
+                                        'Status' => $status ?: 'ongoing',
+                                        'Daily Rate' => '₱' . number_format(
+                                            ((float)($row['applied_rate'] ?? 0) > 0
+                                                ? (float)$row['applied_rate']
+                                                : (float)($row['daily_rate'] ?? 0)),
+                                            2
+                                        ),
+                                        'Booked Total' => '₱' . number_format((float)($row['total_cost'] ?? 0), 2),
+                                        'Hours Overdue' => number_format($hoursOver) . ' hr' . ($hoursOver === 1 ? '' : 's'),
+                                        'Overcharge Rate' => '₱100.00 / hour',
+                                        'Overcharge Fee' => '₱' . number_format($overcharge, 2),
+                                    ],
+                                    'overcharge' => $overcharge,
+                                    'hours_overdue' => $hoursOver,
+                                    'href' => 'rentals_all.php',
+                                ];
+                                continue;
+                            }
+                            $badge = $status;
+                            $dateCol = ($type === 'near_return')
+                                ? date('M j, Y', strtotime($end ?: 'now'))
+                                : (date('M j', strtotime($row['start_date'] ?? 'now')) . ' → ' . date('M j, Y', strtotime($end ?: 'now')));
+                            $rows[] = [
+                                'id' => (int)$row['id'],
+                                'cells' => [
+                                    $row['customer_name'] ?? '—',
+                                    $row['make_model'] ?? '—',
+                                    $row['plate_no'] ?? '—',
+                                    $dateCol,
+                                    $badge,
+                                ],
+                                'href' => 'rentals_all.php',
+                            ];
+                        }
+                    }
+                } elseif ($type === 'fleet_status') {
+                    $columns = ['Vehicle', 'Plate', 'Type', 'Status', 'Daily Rate'];
+                    $pageLink = 'vehicles_all.php';
+                    $sql = "
+                        SELECT id, make_model, plate_no, vehicle_type, current_status, daily_rate, daily_rate_cdo
+                        FROM vehicles
+                        ORDER BY FIELD(LOWER(COALESCE(current_status,'')),'available','rented','maintenance','unavailable'), make_model ASC
+                        LIMIT 80
+                    ";
+                    $res = $conn->query($sql);
+                    if ($res) {
+                        while ($row = $res->fetch_assoc()) {
+                            $rate = (float)($row['daily_rate_cdo'] ?? $row['daily_rate'] ?? 0);
+                            $rows[] = [
+                                'id' => (int)$row['id'],
+                                'cells' => [
+                                    $row['make_model'] ?? '—',
+                                    $row['plate_no'] ?? '—',
+                                    $row['vehicle_type'] ?? '—',
+                                    strtolower((string)($row['current_status'] ?? 'unknown')),
+                                    '₱' . number_format($rate, 2),
+                                ],
+                                'href' => 'vehicles_all.php',
+                            ];
+                        }
+                    }
+                } elseif ($type === 'open_maintenance') {
+                    $columns = ['Vehicle', 'Plate', 'Type', 'Schedule', 'Status'];
+                    $pageLink = 'maintenance_all.php';
+                    $sql = "
+                        SELECT m.id, m.type, m.schedule_date, m.status,
+                               v.make_model, v.plate_no
+                        FROM maintenance m
+                        LEFT JOIN vehicles v ON v.id = m.vehicle_id
+                        WHERE LOWER(COALESCE(m.status,'')) IN ('scheduled','in_progress','pending')
+                        ORDER BY m.schedule_date ASC, m.id DESC
+                        LIMIT 50
+                    ";
+                    $res = $conn->query($sql);
+                    if ($res) {
+                        while ($row = $res->fetch_assoc()) {
+                            $rows[] = [
+                                'id' => (int)$row['id'],
+                                'cells' => [
+                                    $row['make_model'] ?? '—',
+                                    $row['plate_no'] ?? '—',
+                                    $row['type'] ?? '—',
+                                    $row['schedule_date'] ? date('M j, Y', strtotime($row['schedule_date'])) : '—',
+                                    strtolower((string)($row['status'] ?? '')),
+                                ],
+                                'href' => 'maintenance_all.php',
+                            ];
+                        }
+                    }
+                } else { // needs_maintenance
+                    $columns = ['Vehicle', 'Plate', 'Vehicle Status', 'Next Service', 'Maint. Status'];
+                    $pageLink = 'maintenance_all.php';
+                    $sql = "
+                        SELECT v.id, v.make_model, v.plate_no, v.current_status,
+                               MIN(m.schedule_date) AS schedule_date,
+                               SUBSTRING_INDEX(GROUP_CONCAT(m.status ORDER BY m.schedule_date ASC SEPARATOR ','), ',', 1) AS maint_status
+                        FROM vehicles v
+                        LEFT JOIN maintenance m
+                          ON m.vehicle_id = v.id
+                         AND LOWER(COALESCE(m.status,'')) IN ('scheduled','in_progress','pending')
+                         AND m.schedule_date <= DATE_ADD(CURDATE(), INTERVAL 7 DAY)
+                        WHERE LOWER(COALESCE(v.current_status,'')) IN ('maintenance','scheduled_maintenance','inspection','unavailable')
+                           OR m.id IS NOT NULL
+                        GROUP BY v.id, v.make_model, v.plate_no, v.current_status
+                        ORDER BY COALESCE(MIN(m.schedule_date), '9999-12-31') ASC, v.make_model ASC
+                        LIMIT 50
+                    ";
+                    $res = $conn->query($sql);
+                    if ($res) {
+                        while ($row = $res->fetch_assoc()) {
+                            $rows[] = [
+                                'id' => (int)$row['id'],
+                                'cells' => [
+                                    $row['make_model'] ?? '—',
+                                    $row['plate_no'] ?? '—',
+                                    strtolower((string)($row['current_status'] ?? '—')),
+                                    !empty($row['schedule_date']) ? date('M j, Y', strtotime($row['schedule_date'])) : '—',
+                                    strtolower((string)($row['maint_status'] ?? 'flagged')),
+                                ],
+                                'href' => 'maintenance_all.php',
+                            ];
+                        }
+                    }
+                }
+
+                echo json_encode([
+                    'success' => true,
+                    'type' => $type,
+                    'title' => $titles[$type],
+                    'columns' => $columns,
+                    'rows' => $rows,
+                    'count' => count($rows),
+                    'page_link' => $pageLink,
+                ]);
                 break;
                 
             default:
@@ -259,11 +511,62 @@ if (!isset($_GET['ajax'])) {
 $today=date('Y-m-d');
 
 /* ---------- KPI Cards ---------- */
-$totalVehicles=(int)scalar($conn,"SELECT COUNT(*) FROM vehicles");
-$availableToday=(int)scalar($conn,"SELECT COUNT(*) FROM vehicles WHERE current_status='available'");
-$activeRentals = (int)scalar($conn,"SELECT COUNT(*) FROM rentals WHERE status IN('pending','reserved','ongoing')");
-$maintDue=(int)scalar($conn,"SELECT COUNT(*) FROM maintenance WHERE status IN('scheduled','in_progress') AND schedule_date=CURDATE()");
-$overdueRentals=(int)scalar($conn,"SELECT COUNT(*) FROM rentals WHERE status = 'ongoing' AND end_date < CURDATE()");
+$totalVehicles = (int)scalar($conn, "SELECT COUNT(*) FROM vehicles");
+$availableToday = (int)scalar($conn, "SELECT COUNT(*) FROM vehicles WHERE current_status='available'");
+$rentedVehicles = (int)scalar($conn, "SELECT COUNT(*) FROM vehicles WHERE LOWER(current_status) IN ('rented','ongoing','reserved')");
+$activeRentals = (int)scalar($conn, "SELECT COUNT(*) FROM rentals WHERE LOWER(COALESCE(status,'')) IN ('pending','reserved','ongoing')");
+$ongoingRentals = (int)scalar($conn, "SELECT COUNT(*) FROM rentals WHERE LOWER(COALESCE(status,'')) = 'ongoing'");
+$newBookings = (int)scalar($conn, "SELECT COUNT(*) FROM rentals WHERE LOWER(COALESCE(status,'')) IN ('pending','reserved')");
+$newBookingsToday = (int)scalar($conn, "SELECT COUNT(*) FROM rentals WHERE DATE(created_at)=CURDATE() AND LOWER(COALESCE(status,'')) NOT IN ('cancelled')");
+$nearReturn = (int)scalar($conn, "
+  SELECT COUNT(*) FROM rentals
+  WHERE LOWER(COALESCE(status,'')) = 'ongoing'
+    AND end_date BETWEEN CURDATE() AND DATE_ADD(CURDATE(), INTERVAL 3 DAY)
+    AND TIMESTAMP(end_date, COALESCE(NULLIF(end_time,''), '23:59:59')) >= NOW()
+");
+$overdueRentals = (int)scalar($conn, "
+  SELECT COUNT(*) FROM rentals
+  WHERE LOWER(COALESCE(status,'')) = 'ongoing'
+    AND TIMESTAMP(end_date, COALESCE(NULLIF(end_time,''), '23:59:59')) < NOW()
+");
+$maxOverdueDays = (int)scalar($conn, "
+  SELECT COALESCE(MAX(DATEDIFF(CURDATE(), end_date)), 0) FROM rentals
+  WHERE LOWER(COALESCE(status,'')) = 'ongoing'
+    AND TIMESTAMP(end_date, COALESCE(NULLIF(end_time,''), '23:59:59')) < NOW()
+");
+$totalOvercharge = (float)scalar($conn, "
+  SELECT COALESCE(SUM(
+    CEILING(
+      GREATEST(
+        TIMESTAMPDIFF(SECOND, TIMESTAMP(end_date, COALESCE(NULLIF(end_time,''), '23:59:59')), NOW()),
+        0
+      ) / 3600
+    ) * 100
+  ), 0)
+  FROM rentals
+  WHERE LOWER(COALESCE(status,'')) = 'ongoing'
+    AND TIMESTAMP(end_date, COALESCE(NULLIF(end_time,''), '23:59:59')) < NOW()
+");
+$openMaintenance = (int)scalar($conn, "
+  SELECT COUNT(*) FROM maintenance
+  WHERE LOWER(COALESCE(status,'')) IN ('scheduled','in_progress','pending')
+");
+$maintDueToday = (int)scalar($conn, "
+  SELECT COUNT(*) FROM maintenance
+  WHERE LOWER(COALESCE(status,'')) IN ('scheduled','in_progress','pending')
+    AND schedule_date = CURDATE()
+");
+$vehiclesNeedMaint = (int)scalar($conn, "
+  SELECT COUNT(DISTINCT v.id)
+  FROM vehicles v
+  LEFT JOIN maintenance m
+    ON m.vehicle_id = v.id
+   AND LOWER(COALESCE(m.status,'')) IN ('scheduled','in_progress','pending')
+   AND m.schedule_date <= DATE_ADD(CURDATE(), INTERVAL 7 DAY)
+  WHERE LOWER(COALESCE(v.current_status,'')) IN ('maintenance','scheduled_maintenance','inspection','unavailable')
+     OR m.id IS NOT NULL
+");
+$maintDue = $maintDueToday;
 
 // Initialize forecast variables from included files
 $forecastValue = 0;
@@ -284,7 +587,7 @@ $monthlyRevenue = (float)scalar($conn,"SELECT COALESCE(SUM(total_cost), 0) FROM 
 $lastMonthRevenue = (float)scalar($conn,"SELECT COALESCE(SUM(total_cost), 0) FROM rentals WHERE MONTH(created_at) = MONTH(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) AND YEAR(created_at) = YEAR(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) AND status = 'completed'");
 
 $avgRentalDuration = (float)scalar($conn,"SELECT COALESCE(AVG(total_days), 0) FROM rentals WHERE status = 'completed'");
-$utilizationRate = $totalVehicles > 0 ? round(($activeRentals / $totalVehicles) * 100, 1) : 0;
+$utilizationRate = $totalVehicles > 0 ? round(($ongoingRentals / $totalVehicles) * 100, 1) : 0;
 
 /* ---------- Real-time Alerts & Notifications ---------- */
 $alertSummary = $conn->query("
@@ -296,8 +599,8 @@ $alertSummary = $conn->query("
 ")->fetch_assoc();
 
 $urgentMaintenance = (int)($alertSummary['urgent_maintenance'] ?? 0);
-$overdueRentals = (int)($alertSummary['overdue_rentals'] ?? 0);
 $pendingApprovals = (int)($alertSummary['pending_approvals'] ?? 0);
+$vehiclesInMaintenance = (int)($alertSummary['vehicles_in_maintenance'] ?? 0);
 
 /* ---------- Trend Calculations ---------- */
 $lastMonth = date('Y-m', strtotime('-1 month'));
@@ -485,13 +788,255 @@ $pageTitle = 'Dashboard';
         .kpi-icon.warning { background: linear-gradient(135deg, #f59e0b, #d97706); }
         .kpi-icon.danger { background: linear-gradient(135deg, #ef4444, #dc2626); }
         .kpi-icon.info { background: linear-gradient(135deg, #06b6d4, #0891b2); }
+        .kpi-icon.purple { background: linear-gradient(135deg, #8b5cf6, #7c3aed); }
 
         .kpi-value {
             font-size: 1.75rem;
             font-weight: 700;
             color: #f8fafc;
-            margin-bottom: 8px;
+            margin-bottom: 6px;
             line-height: 1.2;
+        }
+
+        .kpi-hint {
+            font-size: 0.78rem;
+            color: #94a3b8;
+            font-weight: 500;
+            line-height: 1.35;
+            margin-top: auto;
+        }
+
+        .kpi-card a.kpi-link {
+            position: absolute;
+            inset: 0;
+            z-index: 1;
+        }
+
+        .kpi-card[role="button"] {
+            user-select: none;
+        }
+        .kpi-card.kpi-critical {
+            border-color: rgba(239, 68, 68, 0.45);
+            background: linear-gradient(135deg, #3a1f24 0%, #2c3039 55%, #363a44 100%);
+            box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.12), 0 8px 24px rgba(239, 68, 68, 0.12);
+        }
+        .kpi-card.kpi-critical::before {
+            background: linear-gradient(90deg, #ef4444, #f97316, transparent);
+            height: 4px;
+        }
+        .kpi-card.kpi-critical:hover {
+            border-color: rgba(239, 68, 68, 0.7);
+            box-shadow: 0 8px 28px rgba(239, 68, 68, 0.22);
+        }
+        .kpi-card.kpi-critical .kpi-value { color: #fecaca; }
+        .kpi-card.kpi-critical .kpi-label { color: #fca5a5; }
+
+        /* KPI Details Modal */
+        .kpi-modal-bg {
+            position: fixed;
+            inset: 0;
+            z-index: 10060;
+            background: rgba(0,0,0,.72);
+            backdrop-filter: blur(10px);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            padding: 20px 16px;
+            overflow-y: auto;
+        }
+        .kpi-modal-bg.open { display: flex; }
+        body.kpi-modal-open { overflow: hidden; }
+        .kpi-modal {
+            width: min(920px, 96vw);
+            max-height: min(88vh, 860px);
+            background: linear-gradient(145deg, #1a1f28, #232833);
+            border: 1px solid rgba(93,208,255,.22);
+            border-radius: 18px;
+            box-shadow: 0 28px 60px rgba(0,0,0,.55);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            margin: auto;
+        }
+        .kpi-modal__head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 18px 20px;
+            border-bottom: 1px solid rgba(255,255,255,.08);
+            flex-shrink: 0;
+        }
+        .kpi-modal__title {
+            margin: 0;
+            font-size: 1.2rem;
+            font-weight: 800;
+            color: #f8fafc;
+        }
+        .kpi-modal__meta {
+            margin-top: 4px;
+            color: #94a3b8;
+            font-size: .85rem;
+            font-weight: 600;
+        }
+        .kpi-modal__close {
+            width: 36px; height: 36px;
+            border-radius: 10px;
+            border: 1px solid rgba(255,255,255,.12);
+            background: rgba(255,255,255,.04);
+            color: #94a3b8;
+            font-size: 1.25rem;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .kpi-modal__close:hover { color: #f8fafc; border-color: #5dd0ff; }
+        .kpi-modal__body {
+            padding: 16px 20px 20px;
+            overflow: auto;
+            flex: 1;
+            min-height: 0;
+        }
+        .kpi-modal__foot {
+            padding: 12px 20px 18px;
+            border-top: 1px solid rgba(255,255,255,.08);
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+            flex-shrink: 0;
+        }
+        .kpi-modal__foot .btn-secondary,
+        .kpi-modal__foot .btn-primary {
+            padding: 8px 14px;
+            border-radius: 10px;
+            border: 0;
+            font-weight: 700;
+            font-size: .88rem;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+        }
+        .kpi-modal__foot .btn-secondary {
+            background: rgba(255,255,255,.08);
+            color: #e2e8f0;
+        }
+        .kpi-modal__foot .btn-primary {
+            background: linear-gradient(135deg, #3b82f6, #2563eb);
+            color: #fff;
+        }
+        .kpi-table-wrap { overflow-x: auto; }
+        .kpi-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: .9rem;
+        }
+        .kpi-table th {
+            text-align: left;
+            padding: 10px 12px;
+            color: #94a3b8;
+            font-size: .72rem;
+            text-transform: uppercase;
+            letter-spacing: .4px;
+            border-bottom: 1px solid rgba(255,255,255,.08);
+            white-space: nowrap;
+        }
+        .kpi-table td {
+            padding: 12px;
+            color: #e2e8f0;
+            border-bottom: 1px solid rgba(255,255,255,.05);
+            vertical-align: middle;
+        }
+        .kpi-table tr:hover td { background: rgba(93,208,255,.05); }
+        .kpi-table tr.kpi-row-main {
+            cursor: pointer;
+        }
+        .kpi-table tr.kpi-row-main.is-open td {
+            background: rgba(239,68,68,.08);
+            border-bottom-color: transparent;
+        }
+        .kpi-table tr.kpi-row-main td:first-child {
+            position: relative;
+            padding-left: 28px;
+        }
+        .kpi-table tr.kpi-row-main td:first-child::before {
+            content: '▸';
+            position: absolute;
+            left: 10px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: #94a3b8;
+            font-size: .75rem;
+            transition: transform .15s ease;
+        }
+        .kpi-table tr.kpi-row-main.is-open td:first-child::before {
+            transform: translateY(-50%) rotate(90deg);
+            color: #fca5a5;
+        }
+        .kpi-row-detail { display: none; }
+        .kpi-row-detail.is-open { display: table-row; }
+        .kpi-row-detail > td {
+            background: rgba(15, 23, 42, 0.55);
+            border-bottom: 1px solid rgba(239,68,68,.2);
+            padding: 0 12px 14px;
+        }
+        .kpi-detail-panel {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 10px 18px;
+            padding: 12px 8px 4px;
+            border-radius: 12px;
+            border: 1px solid rgba(255,255,255,.06);
+            background: rgba(255,255,255,.02);
+        }
+        .kpi-detail-item .k {
+            display: block;
+            color: #94a3b8;
+            font-size: .68rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: .35px;
+            margin-bottom: 3px;
+        }
+        .kpi-detail-item .v {
+            color: #e2e8f0;
+            font-size: .88rem;
+            font-weight: 600;
+            word-break: break-word;
+        }
+        .kpi-detail-item.highlight .v {
+            color: #fecaca;
+            font-size: 1.05rem;
+            font-weight: 800;
+        }
+        @media (max-width: 640px) {
+            .kpi-detail-panel { grid-template-columns: 1fr; }
+        }
+        .kpi-badge {
+            display: inline-flex;
+            padding: 3px 8px;
+            border-radius: 999px;
+            font-size: .72rem;
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: .3px;
+            background: rgba(148,163,184,.15);
+            color: #cbd5e1;
+        }
+        .kpi-badge.ongoing, .kpi-badge.available, .kpi-badge.completed { background: rgba(16,185,129,.18); color: #6ee7b7; }
+        .kpi-badge.pending, .kpi-badge.reserved, .kpi-badge.scheduled, .kpi-badge.flagged { background: rgba(245,158,11,.18); color: #fcd34d; }
+        .kpi-badge.overdue, .kpi-badge.maintenance, .kpi-badge.cancelled, .kpi-badge.unavailable { background: rgba(239,68,68,.18); color: #fca5a5; }
+        .kpi-badge.rented, .kpi-badge.in_progress { background: rgba(59,130,246,.18); color: #93c5fd; }
+        .kpi-empty {
+            text-align: center;
+            padding: 40px 16px;
+            color: #94a3b8;
+        }
+        .kpi-loading {
+            text-align: center;
+            padding: 48px 16px;
+            color: #94a3b8;
         }
 
         .kpi-trend {
@@ -800,13 +1345,19 @@ $pageTitle = 'Dashboard';
             }
         }
 
+        @media (max-width: 520px) {
+            .kpi-grid {
+                grid-template-columns: 1fr 1fr;
+            }
+        }
+
         @media (max-width: 768px) {
             .dashboard-container {
                 padding: 16px;
             }
             
             .kpi-grid {
-                grid-template-columns: repeat(2, 1fr);
+                grid-template-columns: repeat(3, 1fr);
             }
             
             .forecast-card {
@@ -877,6 +1428,96 @@ $pageTitle = 'Dashboard';
             <i class="fas fa-sync-alt"></i>
             <span>Refresh Data</span>
         </button>
+    </div>
+
+    <!-- KPI Overview -->
+    <section class="kpi-section">
+        <div class="section-header">
+            <h2 class="section-title"><i class="fas fa-tachometer-alt"></i> Operations Overview</h2>
+            <div class="section-divider"></div>
+        </div>
+
+        <div class="kpi-grid">
+            <div class="kpi-card" role="button" tabindex="0" data-kpi="active_rentals" aria-label="View active rentals details">
+                <div class="kpi-header">
+                    <div class="kpi-label">Active Rentals</div>
+                    <div class="kpi-icon primary"><i class="fas fa-key"></i></div>
+                </div>
+                <div class="kpi-value"><?= (int)$activeRentals ?></div>
+                <div class="kpi-hint"><?= (int)$ongoingRentals ?> ongoing · <?= (int)$newBookings ?> awaiting start</div>
+            </div>
+
+            <div class="kpi-card" role="button" tabindex="0" data-kpi="new_bookings" aria-label="View new bookings details">
+                <div class="kpi-header">
+                    <div class="kpi-label">New Bookings</div>
+                    <div class="kpi-icon purple"><i class="fas fa-calendar-plus"></i></div>
+                </div>
+                <div class="kpi-value"><?= (int)$newBookings ?></div>
+                <div class="kpi-hint"><?= (int)$newBookingsToday ?> created today</div>
+            </div>
+
+            <div class="kpi-card" role="button" tabindex="0" data-kpi="fleet_status" aria-label="View fleet status details">
+                <div class="kpi-header">
+                    <div class="kpi-label">Fleet Status</div>
+                    <div class="kpi-icon success"><i class="fas fa-car"></i></div>
+                </div>
+                <div class="kpi-value"><?= (int)$availableToday ?></div>
+                <div class="kpi-hint"><?= (int)$rentedVehicles ?> rented · <?= (int)$totalVehicles ?> total · <?= h((string)$utilizationRate) ?>% util.</div>
+            </div>
+
+            <div class="kpi-card" role="button" tabindex="0" data-kpi="needs_maintenance" aria-label="View vehicles needing maintenance">
+                <div class="kpi-header">
+                    <div class="kpi-label">Needs Maintenance</div>
+                    <div class="kpi-icon danger"><i class="fas fa-exclamation-triangle"></i></div>
+                </div>
+                <div class="kpi-value"><?= (int)$vehiclesNeedMaint ?></div>
+                <div class="kpi-hint"><?= (int)$vehiclesInMaintenance ?> marked in maintenance · <?= (int)$openMaintenance ?> open job<?= $openMaintenance === 1 ? '' : 's' ?></div>
+            </div>
+
+            <div class="kpi-card kpi-critical" role="button" tabindex="0" data-kpi="overdue_returns" aria-label="View cars that exceeded rental period">
+                <div class="kpi-header">
+                    <div class="kpi-label">Exceeded Period</div>
+                    <div class="kpi-icon danger"><i class="fas fa-clock"></i></div>
+                </div>
+                <div class="kpi-value"><?= (int)$overdueRentals ?></div>
+                <div class="kpi-hint">
+                  <?php if ($overdueRentals > 0): ?>
+                    Past due · ₱<?= number_format($totalOvercharge, 0) ?> overcharge
+                  <?php else: ?>
+                    No overdue rentals
+                  <?php endif; ?>
+                </div>
+            </div>
+
+            <div class="kpi-card" role="button" tabindex="0" data-kpi="near_return" aria-label="View cars near return">
+                <div class="kpi-header">
+                    <div class="kpi-label">Near Return</div>
+                    <div class="kpi-icon info"><i class="fas fa-undo"></i></div>
+                </div>
+                <div class="kpi-value"><?= (int)$nearReturn ?></div>
+                <div class="kpi-hint">Due within 3 days</div>
+            </div>
+        </div>
+    </section>
+
+    <!-- KPI Details Modal -->
+    <div class="kpi-modal-bg" id="kpiModalBg" aria-hidden="true">
+      <div class="kpi-modal" role="dialog" aria-modal="true" aria-labelledby="kpiModalTitle">
+        <div class="kpi-modal__head">
+          <div>
+            <h3 class="kpi-modal__title" id="kpiModalTitle">Details</h3>
+            <div class="kpi-modal__meta" id="kpiModalMeta"></div>
+          </div>
+          <button type="button" class="kpi-modal__close" id="kpiModalClose" aria-label="Close">×</button>
+        </div>
+        <div class="kpi-modal__body" id="kpiModalBody">
+          <div class="kpi-loading">Loading…</div>
+        </div>
+        <div class="kpi-modal__foot">
+          <button type="button" class="btn-secondary" id="kpiModalDismiss">Close</button>
+          <a class="btn-primary" id="kpiModalOpenPage" href="#">Open full page</a>
+        </div>
+      </div>
     </div>
 
     <!-- Forecast Insight Section -->
@@ -1307,6 +1948,129 @@ if (mostRentedCtx && mostRentedData.length > 0) {
 } else if (mostRentedCtx) {
     mostRentedCtx.parentElement.innerHTML = '<div class="empty-state"><i class="fas fa-car"></i><div>No vehicle rental data available</div></div>';
 }
+
+/* ---------- KPI detail modal ---------- */
+(function(){
+  const bg = document.getElementById('kpiModalBg');
+  const titleEl = document.getElementById('kpiModalTitle');
+  const metaEl = document.getElementById('kpiModalMeta');
+  const bodyEl = document.getElementById('kpiModalBody');
+  const pageLink = document.getElementById('kpiModalOpenPage');
+  if (!bg || !bodyEl) return;
+
+  const esc = (v) => String(v ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  const statusCell = (v) => {
+    const raw = String(v ?? '').toLowerCase().replace(/\s+/g,'_');
+    const label = String(v ?? '—').replace(/_/g,' ');
+    return `<span class="kpi-badge ${esc(raw)}">${esc(label)}</span>`;
+  };
+  const isStatusCol = (name) => /status/i.test(String(name || ''));
+
+  function openModal() {
+    bg.classList.add('open');
+    bg.setAttribute('aria-hidden', 'false');
+    document.body.classList.add('kpi-modal-open');
+  }
+  function closeModal() {
+    bg.classList.remove('open');
+    bg.setAttribute('aria-hidden', 'true');
+    document.body.classList.remove('kpi-modal-open');
+  }
+
+  async function loadKpi(type) {
+    titleEl.textContent = 'Loading…';
+    metaEl.textContent = '';
+    bodyEl.innerHTML = '<div class="kpi-loading"><i class="fas fa-spinner fa-spin"></i> Loading details…</div>';
+    pageLink.href = '#';
+    openModal();
+    try {
+      const res = await fetch(`dashboard.php?ajax=kpi_details&type=${encodeURIComponent(type)}`);
+      const json = await res.json();
+      if (!json || !json.success) throw new Error(json?.error || 'Failed to load');
+      titleEl.textContent = json.title || 'Details';
+      metaEl.textContent = `${json.count || 0} record${(json.count||0) === 1 ? '' : 's'}`;
+      pageLink.href = json.page_link || 'dashboard.php';
+
+      if (!json.rows || !json.rows.length) {
+        bodyEl.innerHTML = '<div class="kpi-empty"><i class="fas fa-inbox" style="font-size:1.5rem;display:block;margin-bottom:8px;"></i>No records found for this KPI.</div>';
+        return;
+      }
+
+      const cols = json.columns || [];
+      const colCount = Math.max(cols.length, 1);
+      let html = '<div class="kpi-table-wrap"><table class="kpi-table"><thead><tr>';
+      cols.forEach(c => { html += `<th>${esc(c)}</th>`; });
+      html += '</tr></thead><tbody>';
+      json.rows.forEach((row, idx) => {
+        const expandable = !!(row.expandable && row.detail);
+        const rowId = `kpi-exp-${idx}`;
+        html += `<tr class="${expandable ? 'kpi-row-main' : ''}" ${expandable ? `data-expand="${rowId}" role="button" tabindex="0"` : ''}>`;
+        (row.cells || []).forEach((cell, i) => {
+          html += `<td>${isStatusCol(cols[i]) ? statusCell(cell) : esc(cell)}</td>`;
+        });
+        html += '</tr>';
+        if (expandable) {
+          const detail = row.detail || {};
+          let panel = '<div class="kpi-detail-panel">';
+          Object.keys(detail).forEach(key => {
+            const highlight = key === 'Overcharge Fee' || key === 'Hours Overdue' ? ' highlight' : '';
+            panel += `<div class="kpi-detail-item${highlight}"><span class="k">${esc(key)}</span><span class="v">${esc(detail[key])}</span></div>`;
+          });
+          panel += '</div>';
+          html += `<tr class="kpi-row-detail" id="${rowId}"><td colspan="${colCount}">${panel}</td></tr>`;
+        }
+      });
+      html += '</tbody></table></div>';
+      bodyEl.innerHTML = html;
+
+      bodyEl.querySelectorAll('.kpi-row-main').forEach(tr => {
+        const toggle = () => {
+          const id = tr.getAttribute('data-expand');
+          const detail = id ? document.getElementById(id) : null;
+          if (!detail) return;
+          const opening = !tr.classList.contains('is-open');
+          // close others for cleaner UI
+          bodyEl.querySelectorAll('.kpi-row-main.is-open').forEach(other => {
+            if (other === tr) return;
+            other.classList.remove('is-open');
+            const oid = other.getAttribute('data-expand');
+            document.getElementById(oid)?.classList.remove('is-open');
+          });
+          tr.classList.toggle('is-open', opening);
+          detail.classList.toggle('is-open', opening);
+        };
+        tr.addEventListener('click', toggle);
+        tr.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            toggle();
+          }
+        });
+      });
+    } catch (e) {
+      titleEl.textContent = 'Unable to load';
+      bodyEl.innerHTML = `<div class="kpi-empty">${esc(e.message || 'Something went wrong')}</div>`;
+    }
+  }
+
+  document.querySelectorAll('.kpi-card[data-kpi]').forEach(card => {
+    const open = () => loadKpi(card.getAttribute('data-kpi'));
+    card.addEventListener('click', open);
+    card.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        open();
+      }
+    });
+  });
+
+  document.getElementById('kpiModalClose')?.addEventListener('click', closeModal);
+  document.getElementById('kpiModalDismiss')?.addEventListener('click', closeModal);
+  bg.addEventListener('click', (e) => { if (e.target === bg) closeModal(); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && bg.classList.contains('open')) closeModal();
+  });
+})();
 </script>
 </body>
 </html>

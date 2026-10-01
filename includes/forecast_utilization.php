@@ -220,5 +220,3 @@ usort($sortedUnder, function($a, $b){
 });
 $topUnderused = array_slice($sortedUnder, 0, 3);
 
-?>
-

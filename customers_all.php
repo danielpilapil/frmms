@@ -230,8 +230,9 @@ $blacklisted = $conn->query("SELECT COUNT(*) FROM users WHERE role='user' AND st
 <title>Customer Verification • FleetGo Admin</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#0b0d10;--card:#101419;--text:#f2f6fa;--muted:#9aa6b3;--brand:#5dd0ff;--brand2:#7cffc7;--ok:#7cffc7;--warn:#ffd166;--bad:#ff6b6b;--radius:12px;--shadow:0 10px 28px rgba(0,0,0,.45);--glass-bg:rgba(16,20,25,.6);--glass-border:rgba(255,255,255,.1);}
+:root{--bg:#0b0d10;--card:#101419;--text:#f2f6fa;--muted:#9aa6b3;--brand:#5dd0ff;--brand2:#7cffc7;--ok:#7cffc7;--warn:#ffd166;--bad:#ff6b6b;--radius:12px;--radius-sm:10px;--shadow:0 10px 28px rgba(0,0,0,.45);--glass-bg:rgba(16,20,25,.92);--glass-border:rgba(255,255,255,.1);--border:rgba(255,255,255,.1);--text-secondary:#9aa6b3;--text-muted:#7a8794;--text-primary:#f2f6fa;--gradient:linear-gradient(135deg,#5dd0ff,#7cffc7);--nav-h:72px;}
 body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,system-ui,sans-serif;letter-spacing:0.01em;}
+body.modal-open{overflow:hidden;}
 .container{max-width:1400px;margin:0 auto;padding:20px;}
 .header{display:flex;justify-content:space-between;align-items:center;margin-bottom:30px;}
 .header h1{font-size:2rem;font-weight:800;margin:0;}
@@ -252,15 +253,20 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,system-ui
 .document-status{display:flex;flex-direction:column;gap:2px;}
 .document-status .doc-indicator{display:flex;align-items:center;gap:4px;font-size:0.8rem;}
 .document-status .doc-icons{font-size:0.75rem;color:var(--muted);margin-top:2px;}
-.document-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:20px;margin-bottom:20px;}
-.document-item{background:var(--card);border:1px solid var(--border);border-radius:var(--radius-sm);padding:16px;}
+.document-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-bottom:16px;}
+.document-item{background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:var(--radius-sm);padding:16px;}
 .document-item.missing{background:rgba(255,255,255,.02);border:1px dashed var(--border);}
-.document-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;}
-.document-summary{background:var(--card);border:1px solid var(--border);border-radius:var(--radius-sm);padding:20px;}
-.profile-section{background:var(--card);border:1px solid var(--border);border-radius:var(--radius-sm);padding:20px;}
-.profile-section h4{margin:0 0 12px 0;padding-bottom:8px;border-bottom:1px solid var(--border);}
+.document-header{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:10px;}
+.document-summary{background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:var(--radius-sm);padding:16px;}
+.profile-section{background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:14px;padding:18px 20px;}
+.profile-section h4{margin:0 0 14px 0;padding-bottom:10px;border-bottom:1px solid var(--border);color:var(--brand);font-weight:700;font-size:1rem;display:flex;align-items:center;gap:8px;}
+.profile-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px 20px;}
+.profile-field{min-width:0;}
+.profile-field.full{grid-column:1 / -1;}
+.profile-field .k{display:block;color:var(--muted);font-size:.75rem;font-weight:700;text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px;}
+.profile-field .v{display:block;color:var(--text);font-size:.95rem;font-weight:600;line-height:1.45;word-break:break-word;}
 .document-sides{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:8px;}
-.document-side{display:flex;flex-direction:column;}
+.document-side{display:flex;flex-direction:column;min-width:0;}
 .side-label{font-weight:600;color:var(--text-secondary);font-size:0.85rem;margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px;}
 .missing-side{padding:20px;border:2px dashed var(--border);border-radius:6px;text-align:center;color:var(--text-muted);background:rgba(255,255,255,.02);font-size:0.85rem;}
 .badge{padding:4px 8px;border-radius:999px;font-size:.75rem;font-weight:600;text-transform:uppercase;letter-spacing:.5px;}
@@ -268,33 +274,83 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,system-ui
 .badge-yellow{background:rgba(255,209,102,.2);color:var(--warn);border:1px solid rgba(255,209,102,.3);}
 .badge-red{background:rgba(255,107,107,.2);color:var(--bad);border:1px solid rgba(255,107,107,.3);}
 .actions{display:flex;gap:8px;}
-.btn{padding:6px 12px;border-radius:6px;border:0;cursor:pointer;font-size:.8rem;font-weight:500;transition:all .2s;}
+.btn{padding:6px 12px;border-radius:6px;border:0;cursor:pointer;font-size:.8rem;font-weight:500;transition:all .2s;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;}
 .btn-approve{background:var(--ok);color:#04121b;}
 .btn-reject{background:var(--warn);color:#04121b;}
 .btn-blacklist{background:var(--bad);color:#fff;}
 .btn-view{background:var(--brand);color:#04121b;}
+.btn-message{background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;}
+.btn-message:hover{filter:brightness(1.08);}
 .modal{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.8);display:none;align-items:center;justify-content:center;z-index:1000;}
 .modal.open{display:flex;}
 .modal-content{background:var(--glass-bg);padding:24px;border-radius:var(--radius);width:100%;max-width:500px;max-height:90vh;overflow:auto;}
 .modal h3{margin:0 0 16px 0;color:var(--text);}
 .modal input, .modal textarea{width:100%;padding:10px;border-radius:6px;border:1px solid var(--glass-border);background:rgba(13,17,22,.8);color:var(--text);margin-bottom:12px;}
 .modal-actions{display:flex;gap:12px;justify-content:flex-end;}
-:root {
-    --nav-h: 72px;
-}
 
-.slide-panel{position:fixed;top:var(--nav-h);right:0;width:500px;height:calc(100vh - var(--nav-h));background:var(--glass-bg);transform:translateX(100%);transition:transform .3s;z-index:1000;overflow-y:auto;padding-bottom:24px;}
-.slide-panel.open{transform:translateX(0);}
-.slide-backdrop{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.5);display:none;z-index:999;}
+/* Centered customer details modal (replaces right drawer) */
+.slide-backdrop{
+  position:fixed;inset:0;
+  background:rgba(0,0,0,.72);backdrop-filter:blur(10px);
+  display:none;z-index:10040;
+}
 .slide-backdrop.open{display:block;}
-.slide-header{padding:20px;border-bottom:1px solid var(--glass-border);display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:10;background:var(--glass-bg);}
-.slide-body{padding:20px;overflow-y:auto;height:calc(100% - 60px);}
-.tabs{display:flex;border-bottom:1px solid var(--glass-border);margin-bottom:20px;}
-.tab{padding:10px 16px;background:transparent;border:0;color:var(--muted);cursor:pointer;font-weight:500;border-bottom:2px solid transparent;}
+.slide-panel{
+  position:fixed;inset:0;z-index:10050;
+  display:none;align-items:center;justify-content:center;
+  padding:max(20px, calc(var(--nav-h) * .35)) 16px 24px;
+  overflow-y:auto;overscroll-behavior:contain;
+  pointer-events:none;
+}
+.slide-panel.open{display:flex;pointer-events:auto;}
+.slide-panel-dialog{
+  width:min(860px,96vw);
+  max-height:min(90vh,920px);
+  background:linear-gradient(145deg,#0f141a,#151b24);
+  border:1px solid rgba(93,208,255,.22);
+  border-radius:20px;
+  box-shadow:0 28px 60px rgba(0,0,0,.55), 0 0 0 1px rgba(93,208,255,.08);
+  display:flex;flex-direction:column;
+  overflow:hidden;
+  margin:auto;
+  transform:translateY(10px) scale(.98);
+  opacity:0;
+  transition:transform .28s ease, opacity .28s ease;
+}
+.slide-panel.open .slide-panel-dialog{
+  transform:translateY(0) scale(1);
+  opacity:1;
+}
+.slide-header{
+  padding:18px 22px;
+  border-bottom:1px solid var(--glass-border);
+  display:flex;justify-content:space-between;align-items:center;gap:16px;
+  flex-shrink:0;background:rgba(15,20,26,.95);
+}
+.slide-header h3{
+  margin:0;font-size:1.25rem;font-weight:800;letter-spacing:-.02em;
+  color:var(--text);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.slide-close{
+  background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);
+  color:var(--muted);font-size:1.25rem;cursor:pointer;padding:0;
+  border-radius:10px;width:36px;height:36px;flex-shrink:0;
+  display:inline-flex;align-items:center;justify-content:center;
+  transition:background .2s, color .2s, border-color .2s;
+}
+.slide-close:hover{background:rgba(255,255,255,.1);color:var(--text);border-color:var(--brand);}
+.slide-body{padding:18px 22px 24px;overflow-y:auto;flex:1;min-height:0;}
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--glass-border);margin-bottom:18px;}
+.tab{padding:10px 14px;background:transparent;border:0;color:var(--muted);cursor:pointer;font-weight:600;font-size:.9rem;border-bottom:2px solid transparent;margin-bottom:-1px;}
 .tab.active{color:var(--text);border-bottom-color:var(--brand);}
 .tab-content{display:none;}
 .tab-content.active{display:block;}
 .toast{position:fixed;top:20px;right:20px;background:var(--glass-bg);color:var(--text);padding:16px 20px;border-radius:var(--radius);border:1px solid var(--glass-border);z-index:1001;}
+@media (max-width:720px){
+  .profile-grid,.document-grid,.document-sides{grid-template-columns:1fr;}
+  .slide-panel{padding:12px;}
+  .slide-header,.slide-body{padding-left:16px;padding-right:16px;}
+}
 </style>
 </head>
 <body>
@@ -435,6 +491,7 @@ if(isset($user['documents']['ID Back'])) echo '📋 ';
 <td>
 <div class="actions">
 <button class="btn btn-view" onclick="openSlidePanel(<?=$user['id']?>)">View</button>
+<a class="btn btn-message" href="messages.php?user_id=<?=(int)$user['id']?>">Message</a>
 <?php if($user['profile_status']==='pending_approval'): ?>
 <button class="btn btn-approve" onclick="approveUser(<?=$user['id']?>)">Approve</button>
 <button class="btn btn-reject" onclick="openRejectModal(<?=$user['id']?>)">Reject</button>
@@ -451,23 +508,25 @@ if(isset($user['documents']['ID Back'])) echo '📋 ';
 </div>
 </div>
 
-<!-- Slide Panel -->
+<!-- Customer Details Modal -->
 <div class="slide-backdrop" onclick="closeSlidePanel()"></div>
-<div class="slide-panel">
-<div class="slide-header">
-<h3 id="slideTitle">Customer Details</h3>
-<button onclick="closeSlidePanel()" style="background:transparent;border:0;color:var(--muted);font-size:1.5rem;cursor:pointer;">×</button>
-</div>
-<div class="slide-body">
-<div class="tabs">
-<button class="tab active" onclick="switchTab('profile')">Profile</button>
-<button class="tab" onclick="switchTab('documents')">Documents</button>
-<button class="tab" onclick="switchTab('rentals')">Rental History</button>
-</div>
-<div id="profile-tab" class="tab-content active"></div>
-<div id="documents-tab" class="tab-content"></div>
-<div id="rentals-tab" class="tab-content"></div>
-</div>
+<div class="slide-panel" id="customerSlidePanel" onclick="if(event.target===this)closeSlidePanel()">
+  <div class="slide-panel-dialog" role="dialog" aria-modal="true" aria-labelledby="slideTitle">
+    <div class="slide-header">
+      <h3 id="slideTitle">Customer Details</h3>
+      <button type="button" class="slide-close" onclick="closeSlidePanel()" aria-label="Close">×</button>
+    </div>
+    <div class="slide-body">
+      <div class="tabs">
+        <button type="button" class="tab active" data-tab="profile" onclick="switchTab('profile', this)">Profile</button>
+        <button type="button" class="tab" data-tab="documents" onclick="switchTab('documents', this)">Documents</button>
+        <button type="button" class="tab" data-tab="rentals" onclick="switchTab('rentals', this)">Rental History</button>
+      </div>
+      <div id="profile-tab" class="tab-content active"></div>
+      <div id="documents-tab" class="tab-content"></div>
+      <div id="rentals-tab" class="tab-content"></div>
+    </div>
+  </div>
 </div>
 
 <!-- Reject Modal -->
@@ -560,73 +619,58 @@ function openSlidePanel(userId) {
     document.getElementById('slideTitle').textContent = user.full_name;
     
     // Profile tab
+    const esc = (v) => String(v ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    const field = (label, value, full = false) =>
+      `<div class="profile-field${full ? ' full' : ''}"><span class="k">${label}</span><span class="v">${value || 'Not set'}</span></div>`;
+
     document.getElementById('profile-tab').innerHTML = `
-        <div style="display:grid;gap:20px;">
-            <!-- Basic Information Section -->
+        <div style="display:grid;gap:16px;">
             <div class="profile-section">
-                <h4 style="margin-bottom:12px;color:var(--brand);font-weight:700;">👤 Basic Information</h4>
-                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:16px;">
-                    <div><strong>Full Name:</strong><br>${user.full_name}</div>
-                    <div><strong>Email Address:</strong><br>${user.email}</div>
-                    <div><strong>Contact Number:</strong><br>${user.contact_no || user.phone || 'Not set'}</div>
-                    <div><strong>City:</strong><br>${user.city || 'Not set'}</div>
-                    <div style="grid-column:1/-1;"><strong>Complete Address:</strong><br>${user.address || 'Not set'}</div>
+                <h4>👤 Basic Information</h4>
+                <div class="profile-grid">
+                    ${field('Full Name', esc(user.full_name))}
+                    ${field('Email Address', esc(user.email))}
+                    ${field('Contact Number', esc(user.contact_no || user.phone))}
+                    ${field('City', esc(user.city))}
+                    ${field('Complete Address', esc(user.address), true)}
                 </div>
             </div>
-            
-            <!-- License & ID Section -->
+
             <div class="profile-section">
-                <h4 style="margin-bottom:12px;color:var(--brand);font-weight:700;">📄 License & ID Information</h4>
-                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:16px;">
-                    <div>
-                        <strong>Driver's License Number:</strong><br>
-                        <span style="font-family:monospace;font-size:1.1rem;color:var(--text-primary);">${user.driver_license_no || 'Not set'}</span>
-                    </div>
-                    <div>
-                        <strong>License Expiry Date:</strong><br>
-                        <span style="color:${user.driver_license_expiry && new Date(user.driver_license_expiry) > new Date() ? 'var(--success)' : 'var(--error)'};font-weight:600;">
-                            ${user.driver_license_expiry ? new Date(user.driver_license_expiry).toLocaleDateString('en-US', {year: 'numeric', month: 'long', day: 'numeric'}) : 'Not set'}
-                        </span>
-                        ${user.driver_license_expiry && new Date(user.driver_license_expiry) <= new Date() ? '<br><small style="color:var(--error);">⚠️ EXPIRED</small>' : ''}
-                    </div>
-                    <div>
-                        <strong>ID Type:</strong><br>
-                        <span style="background:var(--glass);padding:4px 8px;border-radius:4px;">${user.id_type || 'Not set'}</span>
-                    </div>
-                    <div>
-                        <strong>ID Number:</strong><br>
-                        <span style="font-family:monospace;font-size:1.1rem;color:var(--text-primary);">${user.id_number || 'Not set'}</span>
-                    </div>
+                <h4>📄 License &amp; ID Information</h4>
+                <div class="profile-grid">
+                    ${field("Driver's License Number", `<span style="font-family:ui-monospace,monospace;">${esc(user.driver_license_no) || 'Not set'}</span>`)}
+                    ${field('License Expiry Date', user.driver_license_expiry
+                      ? `<span style="color:${new Date(user.driver_license_expiry) > new Date() ? 'var(--ok)' : 'var(--bad)'};font-weight:700;">${esc(new Date(user.driver_license_expiry).toLocaleDateString('en-US', {year: 'numeric', month: 'long', day: 'numeric'}))}</span>${new Date(user.driver_license_expiry) <= new Date() ? '<br><small style="color:var(--bad);">⚠️ EXPIRED</small>' : ''}`
+                      : 'Not set')}
+                    ${field('ID Type', esc(user.id_type))}
+                    ${field('ID Number', `<span style="font-family:ui-monospace,monospace;">${esc(user.id_number) || 'Not set'}</span>`)}
                 </div>
             </div>
-            
-            <!-- Emergency Contact Section -->
+
             <div class="profile-section">
-                <h4 style="margin-bottom:12px;color:var(--brand);font-weight:700;">🚨 Emergency Contact</h4>
-                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:16px;">
-                    <div><strong>Emergency Contact Name:</strong><br>${user.emergency_name || 'Not set'}</div>
-                    <div><strong>Emergency Contact Phone:</strong><br>${user.emergency_phone || 'Not set'}</div>
+                <h4>🚨 Emergency Contact</h4>
+                <div class="profile-grid">
+                    ${field('Emergency Contact Name', esc(user.emergency_name))}
+                    ${field('Emergency Contact Phone', esc(user.emergency_phone))}
                 </div>
             </div>
-            
-            <!-- Status Section -->
+
             <div class="profile-section">
-                <h4 style="margin-bottom:12px;color:var(--brand);font-weight:700;">📊 Account Status</h4>
-                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;">
-                    <div>
-                        <strong>Account Status:</strong><br>
-                        <span class="badge badge-${user.status === 'active' ? 'green' : 'red'}">${user.status}</span>
-                    </div>
+                <h4>📊 Account Status</h4>
+                <div class="profile-grid">
+                    ${field('Account Status', `<span class="badge badge-${user.status === 'active' ? 'green' : 'red'}">${esc(user.status)}</span>`)}
                 </div>
             </div>
-            
-            <!-- Additional Information -->
+
             ${(user.rejection_reason || user.blacklist_reason || user.notes) ? `
                 <div class="profile-section">
-                    <h4 style="margin-bottom:12px;color:var(--brand);font-weight:700;">📝 Additional Information</h4>
-                    ${user.rejection_reason ? `<div><strong>Rejection Reason:</strong><br><span style="color:var(--error);background:rgba(239,68,68,.1);padding:8px;border-radius:4px;display:block;">${user.rejection_reason}</span></div>` : ''}
-                    ${user.blacklist_reason ? `<div><strong>Blacklist Reason:</strong><br><span style="color:var(--error);background:rgba(239,68,68,.1);padding:8px;border-radius:4px;display:block;">${user.blacklist_reason}</span></div>` : ''}
-                    ${user.notes ? `<div><strong>Notes:</strong><br><span style="background:var(--glass);padding:8px;border-radius:4px;display:block;">${user.notes}</span></div>` : ''}
+                    <h4>📝 Additional Information</h4>
+                    <div class="profile-grid">
+                      ${user.rejection_reason ? field('Rejection Reason', `<span style="color:var(--bad);">${esc(user.rejection_reason)}</span>`, true) : ''}
+                      ${user.blacklist_reason ? field('Blacklist Reason', `<span style="color:var(--bad);">${esc(user.blacklist_reason)}</span>`, true) : ''}
+                      ${user.notes ? field('Notes', esc(user.notes), true) : ''}
+                    </div>
                 </div>
             ` : ''}
         </div>
@@ -745,22 +789,32 @@ function openSlidePanel(userId) {
     
     // Load rental history
     loadRentalHistory(userId);
-    
+
+    // Reset to Profile tab
+    document.querySelectorAll('.slide-panel .tab').forEach(t => t.classList.toggle('active', t.dataset.tab === 'profile'));
+    document.querySelectorAll('.slide-panel .tab-content').forEach(t => t.classList.toggle('active', t.id === 'profile-tab'));
+
     document.querySelector('.slide-panel').classList.add('open');
     document.querySelector('.slide-backdrop').classList.add('open');
+    document.body.classList.add('modal-open');
 }
 
 function closeSlidePanel() {
     document.querySelector('.slide-panel').classList.remove('open');
     document.querySelector('.slide-backdrop').classList.remove('open');
+    document.body.classList.remove('modal-open');
 }
 
-function switchTab(tabName) {
-    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-    document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
-    event.target.classList.add('active');
-    document.getElementById(tabName + '-tab').classList.add('active');
+function switchTab(tabName, btn) {
+    document.querySelectorAll('.slide-panel .tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.slide-panel .tab-content').forEach(t => t.classList.remove('active'));
+    (btn || document.querySelector(`.slide-panel .tab[data-tab="${tabName}"]`))?.classList.add('active');
+    document.getElementById(tabName + '-tab')?.classList.add('active');
 }
+
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && document.querySelector('.slide-panel.open')) closeSlidePanel();
+});
 
 async function loadRentalHistory(userId) {
     const response = await fetch(`customers_all.php?ajax=rentals&id=${userId}`);

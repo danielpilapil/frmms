@@ -32,6 +32,13 @@ if (($_SESSION['role'] ?? '') !== 'user') {
 $userID   = (int)$_SESSION['user_id'];
 $userName = $_SESSION['user_name'] ?? 'Guest';
 
+if ($userID <= 0) {
+    session_unset();
+    session_destroy();
+    header("Location: login.php");
+    exit;
+}
+
 /* ---------- BOOKING GATE FUNCTION ---------- */
 function isUserVerified($user) {
     return (
@@ -48,10 +55,64 @@ $stmt->execute();
 $user = $stmt->get_result()->fetch_assoc();
 $stmt->close();
 
+if (!$user) {
+    session_unset();
+    session_destroy();
+    header("Location: login.php");
+    exit;
+}
+
+// Keep session display name in sync with DB
+$_SESSION['user_name'] = $user['full_name'];
+$userName = $user['full_name'];
+
 /* ==========================
    PROFILE UPDATE HANDLER
 ========================== */
 if ($_SERVER["REQUEST_METHOD"] === "POST") {
+    /* ---------- SAVE PROFILE PHOTO ONLY ---------- */
+    if (isset($_POST['action']) && $_POST['action'] === 'save_profile_photo') {
+        $uploadDir = "uploads/profiles/";
+        if (!is_dir($uploadDir)) mkdir($uploadDir, 0777, true);
+
+        if (empty($_FILES['profile_photo']['name'])) {
+            $_SESSION['flash_error'] = "Please choose a profile picture first.";
+            header("Location: userprofile.php");
+            exit;
+        }
+
+        $ext = strtolower(pathinfo($_FILES['profile_photo']['name'], PATHINFO_EXTENSION));
+        if (!in_array($ext, ['jpg', 'jpeg', 'png', 'webp', 'gif'], true)) {
+            $_SESSION['flash_error'] = "Invalid image type. Use JPG, PNG, WEBP, or GIF.";
+            header("Location: userprofile.php");
+            exit;
+        }
+
+        if (!empty($_FILES['profile_photo']['error']) && (int)$_FILES['profile_photo']['error'] !== UPLOAD_ERR_OK) {
+            $_SESSION['flash_error'] = "Upload failed. Please try a smaller image.";
+            header("Location: userprofile.php");
+            exit;
+        }
+
+        $newName = $uploadDir . "profile_photo_{$userID}_" . time() . "." . $ext;
+        if (!move_uploaded_file($_FILES['profile_photo']['tmp_name'], $newName)) {
+            $_SESSION['flash_error'] = "Could not save profile picture. Please try again.";
+            header("Location: userprofile.php");
+            exit;
+        }
+
+        $stmt = $conn->prepare("UPDATE users SET profile_photo = ?, updated_at = NOW() WHERE id = ?");
+        $stmt->bind_param("si", $newName, $userID);
+        if ($stmt->execute()) {
+            $_SESSION['flash_message'] = "Profile picture saved!";
+        } else {
+            $_SESSION['flash_error'] = "Failed to save profile picture.";
+        }
+        $stmt->close();
+        header("Location: userprofile.php");
+        exit;
+    }
+
     if (isset($_POST['action']) && $_POST['action'] === 'update_profile') {
         $email = trim($_POST['email'] ?? '');
         $contact_no = trim($_POST['contact_no'] ?? '');
@@ -64,6 +125,15 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
         $emergency_name = trim($_POST['emergency_name'] ?? '');
         $emergency_phone = trim($_POST['emergency_phone'] ?? '');
         $notes = trim($_POST['notes'] ?? '');
+
+        // Normalize phone numbers (UI formats as 09XX XXX XXXX with spaces)
+        $contact_no = preg_replace('/\D+/', '', $contact_no);
+        if ($contact_no !== '' && !preg_match('/^09\d{9}$/', $contact_no)) {
+            $_SESSION['flash_message'] = "Please enter a valid Philippine mobile number (09XX XXX XXXX).";
+            header("Location: userprofile.php");
+            exit;
+        }
+        $emergency_phone = preg_replace('/\D+/', '', $emergency_phone);
         
         $uploadDir = "uploads/profiles/";
         if (!is_dir($uploadDir)) mkdir($uploadDir, 0777, true);
@@ -386,15 +456,8 @@ a{text-decoration:none;color:inherit}
  .verification-card{display:none;}
  .profile-badges{display:none;}
 
- .accordion{display:grid;gap:14px;}
- .accordion-item{
-   background:var(--card);
-   border:1px solid var(--border);
-   border-radius:var(--radius);
-   box-shadow:var(--shadow-lg);
-   overflow:hidden;
- }
- .accordion-trigger{
+ .section-cards{display:grid;gap:14px;}
+ .section-card{
    width:100%;
    display:flex;
    align-items:center;
@@ -402,11 +465,23 @@ a{text-decoration:none;color:inherit}
    gap:12px;
    padding:18px 20px;
    cursor:pointer;
-   background:transparent;
-   border:0;
+   background:var(--card);
+   border:1px solid var(--border);
+   border-radius:var(--radius);
+   box-shadow:var(--shadow-lg);
    color:var(--text-primary);
+   text-align:left;
+   transition:transform .18s ease, border-color .18s ease, box-shadow .18s ease, background .18s ease;
  }
- .accordion-title{
+ .section-card:hover{
+   border-color:rgba(93,208,255,.35);
+   box-shadow:0 10px 28px rgba(0,0,0,.28), 0 0 0 1px rgba(93,208,255,.12);
+   transform:translateY(-1px);
+ }
+ .section-card:active{
+   transform:scale(.985);
+ }
+ .section-card__title{
    display:flex;
    align-items:center;
    gap:10px;
@@ -414,28 +489,146 @@ a{text-decoration:none;color:inherit}
    letter-spacing:-.01em;
    font-size:1.05rem;
  }
- .accordion-meta{
+ .section-card__meta{
    color:var(--text-secondary);
    font-weight:700;
    font-size:.9rem;
  }
- .accordion-icon{
+ .section-card__icon{
    width:34px;height:34px;
    border-radius:10px;
    display:grid;place-items:center;
    background:rgba(93,208,255,.08);
    border:1px solid rgba(93,208,255,.18);
  }
- .accordion-chevron{
-   transition:transform .25s ease;
+ .section-card__chevron{
    opacity:.9;
+   transition:transform .2s ease;
  }
- .accordion-item[data-open="true"] .accordion-chevron{transform:rotate(180deg);}
- .accordion-panel{display:none;padding:0 20px 20px 20px;}
- .accordion-item[data-open="true"] .accordion-panel{display:block;}
+ .section-card:hover .section-card__chevron{transform:translateX(3px);}
 
- .panel-inner{
-   padding-top:14px;
+ .section-modal{
+   position:fixed;
+   inset:0;
+   z-index:10000;
+   display:flex;
+   align-items:stretch;
+   justify-content:center;
+   padding:12px;
+   opacity:0;
+   visibility:hidden;
+   pointer-events:none;
+   transition:opacity .22s ease, visibility .22s ease;
+ }
+ .section-modal.is-open{
+   opacity:1;
+   visibility:visible;
+   pointer-events:auto;
+ }
+ .section-modal__backdrop{
+   position:absolute;
+   inset:0;
+   background:rgba(0,0,0,.78);
+   backdrop-filter:blur(6px);
+ }
+ .section-modal__dialog{
+   position:relative;
+   z-index:1;
+   width:min(1100px, calc(100vw - 24px));
+   height:calc(100vh - 24px);
+   height:calc(100dvh - 24px);
+   max-height:calc(100vh - 24px);
+   max-height:calc(100dvh - 24px);
+   display:flex;
+   flex-direction:column;
+   background:rgba(16,20,25,.98);
+   border:1px solid var(--border);
+   border-radius:18px;
+   box-shadow:var(--shadow-xl), 0 0 0 1px rgba(93,208,255,.08);
+   overflow:hidden;
+   min-height:0;
+   transform:translateY(18px) scale(.98);
+   opacity:0;
+   transition:transform .28s cubic-bezier(.22,1,.36,1), opacity .22s ease;
+ }
+ .section-modal.is-open .section-modal__dialog{
+   transform:translateY(0) scale(1);
+   opacity:1;
+ }
+ .section-modal.is-closing .section-modal__dialog{
+   transform:translateY(12px) scale(.98);
+   opacity:0;
+ }
+ .section-modal__header{
+   display:flex;
+   align-items:center;
+   justify-content:space-between;
+   gap:12px;
+   padding:14px 18px;
+   border-bottom:1px solid var(--border);
+   flex:0 0 auto;
+ }
+ .section-modal__title{
+   display:flex;
+   align-items:center;
+   gap:10px;
+   font-weight:900;
+   font-size:1.1rem;
+   color:var(--text-primary);
+ }
+ .section-modal__close{
+   width:40px;height:40px;
+   border-radius:12px;
+   border:1px solid var(--border);
+   background:rgba(255,255,255,.03);
+   color:var(--text-secondary);
+   font-size:1.4rem;
+   line-height:1;
+   cursor:pointer;
+   transition:background .15s ease, color .15s ease, border-color .15s ease;
+ }
+ .section-modal__close:hover{
+   background:rgba(93,208,255,.08);
+   border-color:rgba(93,208,255,.28);
+   color:var(--text-primary);
+ }
+ .section-modal__body{
+   flex:1 1 auto;
+   min-height:0;
+   height:100%;
+   overflow-x:hidden;
+   overflow-y:auto;
+   -webkit-overflow-scrolling:touch;
+   overscroll-behavior:contain;
+   padding:18px 18px 32px;
+   scrollbar-gutter:stable;
+ }
+ .section-modal__body .form-actions{
+   position:sticky;
+   bottom:0;
+   z-index:2;
+   margin-top:18px;
+   margin-bottom:0;
+   padding:14px 0 6px;
+   background:linear-gradient(180deg, rgba(16,20,25,0), rgba(16,20,25,.98) 24%, rgba(16,20,25,1));
+ }
+ .section-modal__body .file-upload-label{
+   min-height:72px;
+   padding:12px;
+   gap:6px;
+ }
+ .section-modal__body .file-upload-icon{
+   width:22px;
+   height:22px;
+ }
+ .section-modal__body .document-upload-item{
+   padding:12px;
+ }
+ .section-modal__body .document-upload-grid{
+   gap:12px;
+ }
+ .section-modal__body .form-group textarea{
+   min-height:72px;
  }
 
  .image-modal{
@@ -445,7 +638,7 @@ a{text-decoration:none;color:inherit}
    align-items:center;
    justify-content:center;
    background:rgba(0,0,0,.78);
-   z-index:9999;
+   z-index:10001;
  }
  .image-modal.open{display:flex;}
  .image-modal-content{
@@ -484,6 +677,8 @@ a{text-decoration:none;color:inherit}
    background:rgba(255,255,255,.02);
  }
 
+ body.modal-open{overflow:hidden;}
+
  .mobile-actionbar{
    position:fixed;
    left:0;right:0;bottom:0;
@@ -503,7 +698,7 @@ a{text-decoration:none;color:inherit}
   max-width:1200px;margin:80px auto;padding:40px;
   background:var(--card);border-radius:var(--radius);
   box-shadow:var(--shadow-xl),0 0 0 1px var(--border);
-  backdrop-filter:blur(20px);position:relative;overflow:hidden;
+  position:relative;overflow:visible;
 }
 .container::before{
   content:"";position:absolute;top:0;left:0;right:0;height:4px;
@@ -608,6 +803,23 @@ h2{
   background:none;border:none;color:#041f2a;font-size:1rem;cursor:pointer;
   padding:0;margin:0;
 }
+.avatar-save-wrap{
+  display:flex;flex-direction:column;align-items:flex-start;gap:10px;margin-top:4px;
+}
+.btn-save-photo{
+  display:none;align-items:center;justify-content:center;gap:8px;
+  padding:10px 16px;border-radius:12px;border:0;cursor:pointer;
+  background:var(--gradient);color:#041f2a;font-weight:900;font-size:.9rem;
+  box-shadow:0 8px 20px rgba(93,208,255,.28);
+  transition:transform .18s ease, box-shadow .18s ease, opacity .18s ease;
+}
+.btn-save-photo.is-visible{display:inline-flex;}
+.btn-save-photo:hover{transform:translateY(-1px);box-shadow:0 10px 24px rgba(93,208,255,.4);}
+.btn-save-photo:disabled{opacity:.65;cursor:wait;transform:none;}
+.avatar-save-hint{
+  display:none;color:var(--text-secondary);font-size:.82rem;font-weight:600;
+}
+.avatar-save-hint.is-visible{display:block;}
 .profile-info{
   flex:1;
 }
@@ -680,53 +892,48 @@ h2{
 
 /* ===== FILE UPLOAD ===== */
 .file-upload{
-  position:relative;display:inline-block;width:100%;
+  position:relative;display:block;width:100%;
 }
 .file-upload input[type="file"]{
-  position:absolute;opacity:0;width:100%;height:100%;cursor:pointer;
+  position:absolute;opacity:0;width:100%;height:100%;cursor:pointer;inset:0;z-index:2;
 }
 .file-upload-label{
-  display:block;padding:12px 16px;border:2px dashed var(--border);
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;
+  min-height:110px;padding:18px 16px;border:2px dashed var(--border);
   border-radius:var(--radius-sm);text-align:center;cursor:pointer;
   transition:all .3s ease;background:var(--card);
-}
-.file-upload-label{
-  user-select:none;
-  font-weight:700;
-  color:var(--text-primary);
+  user-select:none;font-weight:700;color:var(--text-primary);
 }
 .file-upload-label:hover{
   border-color:var(--brand);background:rgba(93,208,255,.05);
 }
-.document-upload-item .file-upload-label{
-  display:flex;
-  align-items:center;
-  justify-content:center;
-  gap:10px;
+.file-upload-label.has-file{
+  border-style:solid;border-color:rgba(93,208,255,.35);
+  background:rgba(93,208,255,.06);
 }
-.file-preview{
-  margin-top:12px;border-radius:var(--radius-sm);overflow:hidden;
-  width:100%;height:190px;object-fit:cover;border:2px solid var(--border);
-  background:rgba(255,255,255,.02);
+.file-upload-icon{
+  width:28px;height:28px;color:var(--brand);flex-shrink:0;
 }
-.file-preview-placeholder{
-  margin-top:12px;padding:20px;border:2px dashed var(--border);
-  border-radius:var(--radius-sm);text-align:center;color:var(--text-muted);
-  background:rgba(255,255,255,.02);font-size:0.9rem;
+.file-upload-title{
+  font-size:0.95rem;font-weight:800;letter-spacing:.01em;
 }
+.file-upload-side{
+  font-size:0.75rem;font-weight:700;color:var(--text-muted);
+  text-transform:uppercase;letter-spacing:.06em;
+}
+.file-name{
+  margin-top:10px;padding:10px 12px;border-radius:var(--radius-sm);
+  border:1px solid var(--border);background:rgba(255,255,255,.03);
+  color:var(--text-secondary);font-size:0.85rem;font-weight:600;
+  word-break:break-all;line-height:1.4;
+}
+.file-name.is-empty{display:none;}
 .document-upload-grid{
-  display:grid;grid-template-columns:1fr 1fr;gap:20px;
-}
-.document-upload-grid{
-  grid-template-columns:repeat(auto-fit,minmax(240px,1fr));
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:20px;
 }
 .document-upload-item{
-  display:flex;flex-direction:column;
-}
-.document-upload-item{
-  padding:16px;
-  border-radius:var(--radius);
-  border:1px solid var(--border);
+  display:flex;flex-direction:column;padding:16px;
+  border-radius:var(--radius);border:1px solid var(--border);
   background:rgba(255,255,255,.02);
   box-shadow:inset 0 1px 0 rgba(255,255,255,.03);
 }
@@ -825,6 +1032,19 @@ h2{
   .stats-grid{grid-template-columns:repeat(2,1fr);}
   .mobile-actionbar{display:flex;}
   .container{padding-bottom:92px;}
+  .section-modal{
+    align-items:stretch;
+    padding:8px;
+  }
+  .section-modal__dialog{
+    width:calc(100vw - 16px);
+    height:calc(100vh - 16px);
+    height:calc(100dvh - 16px);
+    max-height:calc(100vh - 16px);
+    max-height:calc(100dvh - 16px);
+    border-radius:16px;
+  }
+  body.modal-open .mobile-actionbar{display:none;}
 }
 </style>
 </head>
@@ -889,7 +1109,7 @@ h2{
   <div class="profile-header">
     <div class="profile-avatar-section">
       <div class="profile-avatar">
-        <?php if(!empty($user['profile_photo'])): ?>
+        <?php if(!empty($user['profile_photo']) && is_file(__DIR__ . '/' . ltrim($user['profile_photo'], '/'))): ?>
           <img src="<?= htmlspecialchars($user['profile_photo']) ?>" alt="Profile Photo" class="avatar-image">
         <?php else: ?>
           <div class="avatar-placeholder">
@@ -897,7 +1117,7 @@ h2{
           </div>
         <?php endif; ?>
         <div class="avatar-overlay">
-          <button type="button" class="avatar-edit-btn" onclick="document.getElementById('profile_photo').click()">
+          <button type="button" class="avatar-edit-btn" onclick="document.getElementById('profile_photo').click()" title="Choose photo" aria-label="Choose profile photo">
             📷
           </button>
         </div>
@@ -909,65 +1129,96 @@ h2{
           <span class="profile-badge <?= $profile_status ?>"><?= ucfirst(str_replace('_',' ', $profile_status)) ?></span>
           <span class="profile-badge <?= $verification_status ?>"><?= ucfirst(str_replace('_',' ', $verification_status)) ?></span>
         </div>
+        <form method="POST" enctype="multipart/form-data" id="avatarPhotoForm" class="avatar-save-wrap">
+          <input type="hidden" name="action" value="save_profile_photo">
+          <input type="file" name="profile_photo" accept="image/*" id="profile_photo" style="display:none;">
+          <p class="avatar-save-hint" id="avatarSaveHint">New photo selected — click save to apply it.</p>
+          <button type="submit" class="btn-save-photo" id="saveProfilePhotoBtn" disabled>
+            Save Profile Picture
+          </button>
+        </form>
       </div>
     </div>
   </div>
 
   <!-- ===== PROFILE FORM ===== -->
-  <form method="POST" enctype="multipart/form-data">
+  <form method="POST" enctype="multipart/form-data" id="profileForm">
     <input type="hidden" name="action" value="update_profile">
 
-    <div class="accordion">
-      <div class="accordion-item" data-open="false">
-        <button type="button" class="accordion-trigger" aria-expanded="false">
-          <div class="accordion-title"><span class="accordion-icon">👤</span>Basic Information</div>
-          <div style="display:flex;align-items:center;gap:12px;">
-            <div class="accordion-meta">Tap to view</div>
-            <div class="accordion-chevron">▾</div>
-          </div>
-        </button>
-        <div class="accordion-panel">
-          <div class="panel-inner">
-            <div class="form-grid">
-        <div class="form-group">
-          <label>Full Name</label>
-          <input type="text" name="full_name" value="<?= htmlspecialchars($user['full_name']) ?>" readonly>
+    <div class="section-cards">
+      <button type="button" class="section-card" data-open-modal="modal-basic" aria-haspopup="dialog">
+        <div class="section-card__title"><span class="section-card__icon">👤</span>Basic Information</div>
+        <div style="display:flex;align-items:center;gap:12px;">
+          <div class="section-card__meta">Tap to view</div>
+          <div class="section-card__chevron">›</div>
         </div>
-        
-        <div class="form-group">
-          <label>Email Address</label>
-          <input type="email" name="email" value="<?= htmlspecialchars($user['email']) ?>" required>
+      </button>
+
+      <button type="button" class="section-card" data-open-modal="modal-documents" aria-haspopup="dialog">
+        <div class="section-card__title"><span class="section-card__icon">🪪</span>Documents</div>
+        <div style="display:flex;align-items:center;gap:12px;">
+          <div class="section-card__meta">Tap to view</div>
+          <div class="section-card__chevron">›</div>
         </div>
-        
-        <div class="form-group">
-          <label>Contact Number</label>
-          <input type="tel" name="contact_no" value="<?= htmlspecialchars($user['contact_no']) ?>" required>
+      </button>
+
+      <button type="button" class="section-card" data-open-modal="modal-rentals" aria-haspopup="dialog">
+        <div class="section-card__title"><span class="section-card__icon">📊</span>Rentals</div>
+        <div style="display:flex;align-items:center;gap:12px;">
+          <div class="section-card__meta"><?= (int)($stats['total_rentals'] ?? 0) ?> total</div>
+          <div class="section-card__chevron">›</div>
         </div>
-        
-        <div class="form-group">
-          <label>City</label>
-          <input type="text" name="city" value="<?= htmlspecialchars($user['city']) ?>" placeholder="Enter your city">
+      </button>
+    </div>
+
+    <!-- Basic Information Modal -->
+    <div class="section-modal" id="modal-basic" aria-hidden="true">
+      <div class="section-modal__backdrop" data-close-modal></div>
+      <div class="section-modal__dialog" role="dialog" aria-modal="true" aria-labelledby="modal-basic-title">
+        <div class="section-modal__header">
+          <div class="section-modal__title" id="modal-basic-title"><span class="section-card__icon">👤</span>Basic Information</div>
+          <button type="button" class="section-modal__close" data-close-modal aria-label="Close">×</button>
         </div>
-        
-        <div class="form-group" style="grid-column:1/-1;">
-          <label>Address</label>
-          <textarea name="address" placeholder="Enter your complete address"><?= htmlspecialchars($user['address']) ?></textarea>
-        </div>
+        <div class="section-modal__body">
+          <div class="form-grid">
+            <div class="form-group">
+              <label>Full Name</label>
+              <input type="text" name="full_name" value="<?= htmlspecialchars($user['full_name']) ?>" readonly>
+            </div>
+            
+            <div class="form-group">
+              <label>Email Address</label>
+              <input type="email" name="email" value="<?= htmlspecialchars($user['email']) ?>" required>
+            </div>
+            
+            <div class="form-group">
+              <label>Contact Number</label>
+              <input type="tel" name="contact_no" value="<?= htmlspecialchars($user['contact_no']) ?>" required>
+            </div>
+            
+            <div class="form-group">
+              <label>City</label>
+              <input type="text" name="city" value="<?= htmlspecialchars($user['city']) ?>" placeholder="Enter your city">
+            </div>
+            
+            <div class="form-group" style="grid-column:1/-1;">
+              <label>Address</label>
+              <textarea name="address" placeholder="Enter your complete address"><?= htmlspecialchars($user['address']) ?></textarea>
             </div>
           </div>
         </div>
       </div>
+    </div>
 
-      <div class="accordion-item" data-open="false">
-        <button type="button" class="accordion-trigger" aria-expanded="false">
-          <div class="accordion-title"><span class="accordion-icon">🪪</span>Documents</div>
-          <div style="display:flex;align-items:center;gap:12px;">
-            <div class="accordion-meta">Tap to view</div>
-            <div class="accordion-chevron">▾</div>
-          </div>
-        </button>
-        <div class="accordion-panel">
-          <div class="panel-inner">
+    <!-- Documents Modal -->
+    <div class="section-modal" id="modal-documents" aria-hidden="true">
+      <div class="section-modal__backdrop" data-close-modal></div>
+      <div class="section-modal__dialog" role="dialog" aria-modal="true" aria-labelledby="modal-documents-title">
+        <div class="section-modal__header">
+          <div class="section-modal__title" id="modal-documents-title"><span class="section-card__icon">🪪</span>Documents</div>
+          <button type="button" class="section-modal__close" data-close-modal aria-label="Close">×</button>
+        </div>
+        <div class="section-modal__body">
             <div class="form-grid">
               <div class="form-group">
                 <label>Driver's License Number</label>
@@ -1006,40 +1257,42 @@ h2{
                 <input type="tel" name="emergency_phone" value="<?= htmlspecialchars($user['emergency_phone']) ?>" placeholder="Emergency contact number">
               </div>
               
-              <!-- Hidden profile photo input handled by avatar -->
-              <input type="file" name="profile_photo" accept="image/*" id="profile_photo" style="display:none;">
-              
+              <?php
+                $importIcon = '<svg class="file-upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>';
+                $licenseFront = !empty($userDocuments['License Front']) ? $userDocuments['License Front'] : ($user['license_photo'] ?? '');
+                $licenseBack = $userDocuments['License Back'] ?? '';
+                $idFront = !empty($userDocuments['ID Front']) ? $userDocuments['ID Front'] : ($user['valid_id_photo'] ?? '');
+                $idBack = $userDocuments['ID Back'] ?? '';
+                $licenseFrontName = $licenseFront !== '' ? basename($licenseFront) : '';
+                $licenseBackName = $licenseBack !== '' ? basename($licenseBack) : '';
+                $idFrontName = $idFront !== '' ? basename($idFront) : '';
+                $idBackName = $idBack !== '' ? basename($idBack) : '';
+              ?>
               <div class="form-group" style="grid-column:1/-1;">
                 <label>Driver's License Photos</label>
                 <div class="document-upload-grid">
                   <div class="document-upload-item">
                     <div class="file-upload">
                       <input type="file" name="license_photo_front" accept="image/*" id="license_photo_front">
-                      <label for="license_photo_front" class="file-upload-label">
-                        📄 Front Side
+                      <label for="license_photo_front" class="file-upload-label<?= $licenseFrontName !== '' ? ' has-file' : '' ?>">
+                        <?= $importIcon ?>
+                        <span class="file-upload-title">Attach File</span>
+                        <span class="file-upload-side">Front Side</span>
                       </label>
                     </div>
-                    <?php 
-                  $licenseFront = !empty($userDocuments['License Front']) ? $userDocuments['License Front'] : $user['license_photo'];
-                  if(!empty($licenseFront)): ?>
-                      <img src="<?= htmlspecialchars($licenseFront) ?>" class="file-preview" alt="License Front">
-                    <?php endif; ?>
+                    <div class="file-name<?= $licenseFrontName === '' ? ' is-empty' : '' ?>" data-file-name><?= htmlspecialchars($licenseFrontName) ?></div>
                   </div>
                   
                   <div class="document-upload-item">
                     <div class="file-upload">
                       <input type="file" name="license_photo_back" accept="image/*" id="license_photo_back">
-                      <label for="license_photo_back" class="file-upload-label">
-                        📄 Back Side
+                      <label for="license_photo_back" class="file-upload-label<?= $licenseBackName !== '' ? ' has-file' : '' ?>">
+                        <?= $importIcon ?>
+                        <span class="file-upload-title">Attach File</span>
+                        <span class="file-upload-side">Back Side</span>
                       </label>
                     </div>
-                    <?php if(!empty($userDocuments['License Back'])): ?>
-                      <img src="<?= htmlspecialchars($userDocuments['License Back']) ?>" class="file-preview" alt="License Back">
-                    <?php else: ?>
-                      <div class="file-preview-placeholder">
-                        📄 Back side photo
-                      </div>
-                    <?php endif; ?>
+                    <div class="file-name<?= $licenseBackName === '' ? ' is-empty' : '' ?>" data-file-name><?= htmlspecialchars($licenseBackName) ?></div>
                   </div>
                 </div>
               </div>
@@ -1050,31 +1303,25 @@ h2{
                   <div class="document-upload-item">
                     <div class="file-upload">
                       <input type="file" name="valid_id_photo_front" accept="image/*" id="valid_id_photo_front">
-                      <label for="valid_id_photo_front" class="file-upload-label">
-                        📋 Front Side
+                      <label for="valid_id_photo_front" class="file-upload-label<?= $idFrontName !== '' ? ' has-file' : '' ?>">
+                        <?= $importIcon ?>
+                        <span class="file-upload-title">Attach File</span>
+                        <span class="file-upload-side">Front Side</span>
                       </label>
                     </div>
-                    <?php 
-                  $idFront = !empty($userDocuments['ID Front']) ? $userDocuments['ID Front'] : $user['valid_id_photo'];
-                  if(!empty($idFront)): ?>
-                      <img src="<?= htmlspecialchars($idFront) ?>" class="file-preview" alt="ID Front">
-                    <?php endif; ?>
+                    <div class="file-name<?= $idFrontName === '' ? ' is-empty' : '' ?>" data-file-name><?= htmlspecialchars($idFrontName) ?></div>
                   </div>
                   
                   <div class="document-upload-item">
                     <div class="file-upload">
                       <input type="file" name="valid_id_photo_back" accept="image/*" id="valid_id_photo_back">
-                      <label for="valid_id_photo_back" class="file-upload-label">
-                        📋 Back Side
+                      <label for="valid_id_photo_back" class="file-upload-label<?= $idBackName !== '' ? ' has-file' : '' ?>">
+                        <?= $importIcon ?>
+                        <span class="file-upload-title">Attach File</span>
+                        <span class="file-upload-side">Back Side</span>
                       </label>
                     </div>
-                    <?php if(!empty($userDocuments['ID Back'])): ?>
-                      <img src="<?= htmlspecialchars($userDocuments['ID Back']) ?>" class="file-preview" alt="ID Back">
-                    <?php else: ?>
-                      <div class="file-preview-placeholder">
-                        📋 Back side photo
-                      </div>
-                    <?php endif; ?>
+                    <div class="file-name<?= $idBackName === '' ? ' is-empty' : '' ?>" data-file-name><?= htmlspecialchars($idBackName) ?></div>
                   </div>
                 </div>
               </div>
@@ -1100,21 +1347,19 @@ h2{
                 <?php endif; ?>
               <?php endif; ?>
             </div>
-          </div>
         </div>
       </div>
     </div>
 
-      <div class="accordion-item" data-open="false">
-      <button type="button" class="accordion-trigger" aria-expanded="false">
-        <div class="accordion-title"><span class="accordion-icon">📊</span>Rentals</div>
-        <div style="display:flex;align-items:center;gap:12px;">
-          <div class="accordion-meta"><?= (int)($stats['total_rentals'] ?? 0) ?> total</div>
-          <div class="accordion-chevron">▾</div>
+    <!-- Rentals Modal -->
+    <div class="section-modal" id="modal-rentals" aria-hidden="true">
+      <div class="section-modal__backdrop" data-close-modal></div>
+      <div class="section-modal__dialog" role="dialog" aria-modal="true" aria-labelledby="modal-rentals-title">
+        <div class="section-modal__header">
+          <div class="section-modal__title" id="modal-rentals-title"><span class="section-card__icon">📊</span>Rentals</div>
+          <button type="button" class="section-modal__close" data-close-modal aria-label="Close">×</button>
         </div>
-      </button>
-      <div class="accordion-panel">
-        <div class="panel-inner">
+        <div class="section-modal__body">
           <div class="stats-grid" style="margin-bottom:20px;">
             <div class="stat-card">
               <div class="stat-value"><?= $stats['total_rentals'] ?></div>
@@ -1176,54 +1421,70 @@ h2{
         </div>
       </div>
     </div>
-  </div>
 
   </form>
 
 </div>
 
 <script>
-// File upload preview
+// File upload: show filename only (no image preview for documents)
 document.querySelectorAll('input[type="file"]').forEach(input => {
   input.addEventListener('change', function(e) {
     const file = e.target.files[0];
-    if (file && file.type.startsWith('image/')) {
+    if (!file) return;
+
+    // Profile photo still previews in the avatar
+    if (input.id === 'profile_photo') {
+      if (!file.type.startsWith('image/')) return;
       const reader = new FileReader();
-      reader.onload = function(e) {
-        // Handle profile photo separately
-        if (input.id === 'profile_photo') {
-          // Update avatar image
-          const avatarImage = document.querySelector('.avatar-image');
-          const avatarPlaceholder = document.querySelector('.avatar-placeholder');
-          
-          if (avatarImage) {
-            avatarImage.src = e.target.result;
-          } else if (avatarPlaceholder) {
-            // Replace placeholder with image
-            const newImg = document.createElement('img');
-            newImg.src = e.target.result;
-            newImg.className = 'avatar-image';
-            newImg.alt = 'Profile Photo';
-            avatarPlaceholder.parentNode.replaceChild(newImg, avatarPlaceholder);
-          }
-        } else {
-          // Handle other file previews
-          const existingPreview = input.parentElement.parentElement.querySelector('.file-preview');
-          if (existingPreview) {
-            existingPreview.remove();
-          }
-          
-          const preview = document.createElement('img');
-          preview.src = e.target.result;
-          preview.className = 'file-preview';
-          preview.alt = 'Preview';
-          input.parentElement.parentElement.appendChild(preview);
+      reader.onload = function(ev) {
+        const avatarImage = document.querySelector('.avatar-image');
+        const avatarPlaceholder = document.querySelector('.avatar-placeholder');
+        
+        if (avatarImage) {
+          avatarImage.src = ev.target.result;
+        } else if (avatarPlaceholder) {
+          const newImg = document.createElement('img');
+          newImg.src = ev.target.result;
+          newImg.className = 'avatar-image';
+          newImg.alt = 'Profile Photo';
+          avatarPlaceholder.parentNode.replaceChild(newImg, avatarPlaceholder);
         }
+        const saveBtn = document.getElementById('saveProfilePhotoBtn');
+        const hint = document.getElementById('avatarSaveHint');
+        if (saveBtn) {
+          saveBtn.disabled = false;
+          saveBtn.classList.add('is-visible');
+        }
+        if (hint) hint.classList.add('is-visible');
       };
       reader.readAsDataURL(file);
+      return;
+    }
+
+    const item = input.closest('.document-upload-item');
+    if (!item) return;
+
+    const label = item.querySelector('.file-upload-label');
+    const nameEl = item.querySelector('[data-file-name]');
+    if (label) label.classList.add('has-file');
+    if (nameEl) {
+      nameEl.textContent = file.name;
+      nameEl.classList.remove('is-empty');
     }
   });
 });
+
+const avatarPhotoForm = document.getElementById('avatarPhotoForm');
+if (avatarPhotoForm) {
+  avatarPhotoForm.addEventListener('submit', function() {
+    const saveBtn = document.getElementById('saveProfilePhotoBtn');
+    if (saveBtn) {
+      saveBtn.disabled = true;
+      saveBtn.textContent = 'Saving…';
+    }
+  });
+}
 
 function openImageModal(src, title) {
   const modal = document.getElementById('imageModal');
@@ -1255,25 +1516,69 @@ document.addEventListener('click', function(e) {
     closeImageModal();
     return;
   }
-  if (target && target.classList && target.classList.contains('file-preview')) {
-    openImageModal(target.src, target.alt || 'Document');
-  }
   if (target && target.classList && target.classList.contains('avatar-image')) {
     openImageModal(target.src, 'Profile Photo');
   }
 });
 
 document.addEventListener('keydown', function(e) {
-  if (e.key === 'Escape') closeImageModal();
+  if (e.key === 'Escape') {
+    closeImageModal();
+    closeSectionModal();
+  }
 });
 
-document.querySelectorAll('.accordion-trigger').forEach(btn => {
+function openSectionModal(id) {
+  const modal = document.getElementById(id);
+  if (!modal) return;
+  document.querySelectorAll('.section-modal.is-open').forEach(m => {
+    if (m !== modal) closeSectionModal(m);
+  });
+  // Ensure modal is attached to <body> so it is not clipped by .container
+  if (modal.parentElement !== document.body) {
+    document.body.appendChild(modal);
+  }
+  modal.classList.remove('is-closing');
+  modal.classList.add('is-open');
+  modal.setAttribute('aria-hidden', 'false');
+  document.body.classList.add('modal-open');
+}
+
+function closeSectionModal(target) {
+  const modal = target && target.classList ? target : document.querySelector('.section-modal.is-open');
+  if (!modal || !modal.classList.contains('is-open')) return;
+  modal.classList.add('is-closing');
+  window.setTimeout(() => {
+    modal.classList.remove('is-open', 'is-closing');
+    modal.setAttribute('aria-hidden', 'true');
+    if (!document.querySelector('.section-modal.is-open')) {
+      document.body.classList.remove('modal-open');
+    }
+  }, 220);
+}
+
+// Keep modal fields linked to the profile form after moving modals to <body>
+(function bindSectionModalsToForm() {
+  const form = document.getElementById('profileForm');
+  if (!form) return;
+  document.querySelectorAll('.section-modal').forEach(modal => {
+    modal.querySelectorAll('input, select, textarea, button[type="submit"]').forEach(el => {
+      if (!el.getAttribute('form')) el.setAttribute('form', 'profileForm');
+    });
+    document.body.appendChild(modal);
+  });
+})();
+
+document.querySelectorAll('[data-open-modal]').forEach(btn => {
   btn.addEventListener('click', function() {
-    const item = btn.closest('.accordion-item');
-    if (!item) return;
-    const isOpen = item.getAttribute('data-open') === 'true';
-    item.setAttribute('data-open', isOpen ? 'false' : 'true');
-    btn.setAttribute('aria-expanded', isOpen ? 'false' : 'true');
+    openSectionModal(btn.getAttribute('data-open-modal'));
+  });
+});
+
+document.querySelectorAll('[data-close-modal]').forEach(el => {
+  el.addEventListener('click', function() {
+    const modal = el.closest('.section-modal');
+    closeSectionModal(modal);
   });
 });
 
@@ -1316,7 +1621,10 @@ document.addEventListener('DOMContentLoaded', function() {
   };
   
   const validateField = (field, rules) => {
-    const value = field.value.trim();
+    // Contact is shown as "09XX XXX XXXX"; validate digits so spacing does not fail a valid number.
+    const value = (field.name === 'contact_no' || field.name === 'emergency_phone')
+      ? field.value.replace(/\D/g, '')
+      : field.value.trim();
     let errorMessage = '';
     
     // Remove existing error
@@ -1453,10 +1761,10 @@ document.addEventListener('DOMContentLoaded', function() {
       const idFrontInput = form.querySelector('#valid_id_photo_front');
 
       const hasLicenseFront = !!(licenseFrontInput && (licenseFrontInput.files && licenseFrontInput.files.length > 0)) ||
-        !!(licenseFrontInput && licenseFrontInput.closest('.document-upload-item') && licenseFrontInput.closest('.document-upload-item').querySelector('.file-preview'));
+        !!(licenseFrontInput && licenseFrontInput.closest('.document-upload-item') && licenseFrontInput.closest('.document-upload-item').querySelector('[data-file-name]:not(.is-empty)'));
 
       const hasIdFront = !!(idFrontInput && (idFrontInput.files && idFrontInput.files.length > 0)) ||
-        !!(idFrontInput && idFrontInput.closest('.document-upload-item') && idFrontInput.closest('.document-upload-item').querySelector('.file-preview'));
+        !!(idFrontInput && idFrontInput.closest('.document-upload-item') && idFrontInput.closest('.document-upload-item').querySelector('[data-file-name]:not(.is-empty)'));
 
       if (!hasLicenseFront) {
         missingFields.push('License Photo (Front)');

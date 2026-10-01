@@ -13,29 +13,66 @@ $userName = $_SESSION['user_name'] ?? 'Guest';
 
 $profilePhoto = '';
 $verificationStatus = '';
+$profileStatus = '';
 try {
   if ($userID > 0) {
-    $stmt = $conn->prepare("SELECT COALESCE(profile_photo, photo, '') AS p, COALESCE(verification_status,'') AS v FROM users WHERE id = ? LIMIT 1");
+    $stmt = $conn->prepare("
+      SELECT full_name, profile_photo, verification_status, profile_status
+      FROM users WHERE id = ? LIMIT 1
+    ");
     $stmt->bind_param('i', $userID);
     $stmt->execute();
     $row = $stmt->get_result()->fetch_assoc();
     $stmt->close();
-    $profilePhoto = trim((string)($row['p'] ?? ''));
-    $verificationStatus = trim((string)($row['v'] ?? ''));
+    if ($row) {
+      if (!empty($row['full_name'])) {
+        $userName = (string)$row['full_name'];
+        $_SESSION['user_name'] = $userName;
+      }
+      $profilePhoto = trim((string)($row['profile_photo'] ?? ''));
+      $verificationStatus = strtolower(trim((string)($row['verification_status'] ?? '')));
+      $profileStatus = strtolower(trim((string)($row['profile_status'] ?? '')));
+    }
   }
 } catch (Throwable $e) {
   $profilePhoto = '';
   $verificationStatus = '';
+  $profileStatus = '';
+}
+
+// Only use photo if the file is actually present
+$profilePhotoUrl = '';
+if ($profilePhoto !== '') {
+  $photoFs = __DIR__ . '/../' . ltrim(str_replace('\\', '/', $profilePhoto), '/');
+  if (is_file($photoFs)) {
+    $profilePhotoUrl = $profilePhoto;
+  }
 }
 
 $initials = 'U';
 try {
-  $parts = preg_split('/\s+/', trim((string)$userName));
+  $parts = preg_split('/\s+/', trim((string)$userName)) ?: [];
   $a = strtoupper(substr($parts[0] ?? 'U', 0, 1));
   $b = strtoupper(substr($parts[1] ?? '', 0, 1));
   $initials = $a . ($b !== '' ? $b : '');
 } catch (Throwable $e) {
   $initials = 'U';
+}
+
+$verificationLabel = 'Unverified';
+if ($verificationStatus === 'verified') $verificationLabel = 'Verified';
+elseif ($verificationStatus === 'pending') $verificationLabel = 'Pending Verification';
+elseif ($verificationStatus === 'rejected') $verificationLabel = 'Rejected';
+elseif ($verificationStatus !== '') $verificationLabel = ucwords(str_replace('_', ' ', $verificationStatus));
+
+if ($profileStatus === 'approved' && $verificationStatus === 'verified') {
+  $statusSub = 'Verified · Approved';
+} elseif ($profileStatus === 'approved') {
+  $statusSub = $verificationLabel . ' · Approved';
+} elseif ($profileStatus === 'pending') {
+  $statusSub = $verificationLabel . ' · Profile Pending';
+} else {
+  $statusSub = $verificationLabel;
 }
 
 /* Count unread notifications */
@@ -45,6 +82,14 @@ $stmt->execute();
 $countRes = $stmt->get_result();
 $unreadCount = $countRes ? ($countRes->fetch_assoc()['c'] ?? 0) : 0;
 $stmt->close();
+
+$msgUnreadCount = 0;
+try {
+  require_once __DIR__ . '/chat.php';
+  $msgUnreadCount = chat_user_unread_count($conn, $userID);
+} catch (Throwable $e) {
+  $msgUnreadCount = 0;
+}
 ?>
 <style>
 :root{
@@ -110,6 +155,12 @@ $stmt->close();
   background:linear-gradient(90deg,var(--fg-brand),var(--fg-brand2));
   border-radius:999px;
 }
+.fg-nav-sep{
+  color:rgba(242,246,250,.35);
+  font-weight:800;
+  padding:0 2px;
+  user-select:none;
+}
 
 .fg-nav__right{display:flex;align-items:center;gap:10px;}
 .fg-iconbtn{
@@ -134,6 +185,17 @@ $stmt->close();
   font-weight:900;font-size:11px;
   border:2px solid rgba(16,20,25,.92);
 }
+.fg-msg-badge{
+  position:absolute;top:-4px;right:-8px;
+  min-width:18px;height:18px;padding:0 5px;
+  border-radius:999px;
+  background:#ef4444;color:#fff;
+  display:inline-flex;align-items:center;justify-content:center;
+  font-weight:900;font-size:11px;
+  border:2px solid rgba(16,20,25,.92);
+  line-height:1;
+}
+.fg-msg-badge[hidden]{display:none!important}
 
 .fg-profile{
   position:relative;
@@ -240,6 +302,8 @@ $stmt->close();
       <a class="fg-nav__link" href="myrentals.php">My Rentals</a>
       <a class="fg-nav__link" href="about.php">About</a>
       <a class="fg-nav__link" href="contact.php">Contact</a>
+      <span class="fg-nav-sep" aria-hidden="true">|</span>
+      <a class="fg-nav__link" href="user_messages.php">Messages<span class="fg-msg-badge js-user-msg-badge"<?= $msgUnreadCount > 0 ? '' : ' hidden' ?>><?= $msgUnreadCount > 99 ? '99+' : (int)$msgUnreadCount ?></span></a>
     </nav>
 
     <div class="fg-nav__right">
@@ -264,8 +328,8 @@ $stmt->close();
       <div class="fg-profile" id="fgProfile">
         <button class="fg-profile__btn" type="button" id="fgProfileBtn" aria-haspopup="menu" aria-expanded="false">
           <div class="fg-avatar">
-            <?php if ($profilePhoto !== ''): ?>
-              <img src="<?= htmlspecialchars($profilePhoto, ENT_QUOTES, 'UTF-8') ?>" alt="Profile">
+            <?php if ($profilePhotoUrl !== ''): ?>
+              <img src="<?= htmlspecialchars($profilePhotoUrl, ENT_QUOTES, 'UTF-8') ?>" alt="Profile" onerror="this.style.display='none'; this.parentElement.insertAdjacentText('beforeend','<?= htmlspecialchars($initials, ENT_QUOTES, 'UTF-8') ?>');">
             <?php else: ?>
               <?= htmlspecialchars($initials, ENT_QUOTES, 'UTF-8') ?>
             <?php endif; ?>
@@ -278,8 +342,8 @@ $stmt->close();
 
         <div class="fg-dropdown" id="fgProfileMenu" role="menu">
           <div class="fg-dropdown__head">
-            <div class="fg-dropdown__title">Account</div>
-            <div class="fg-dropdown__sub"><?= htmlspecialchars($verificationStatus !== '' ? $verificationStatus : 'unverified', ENT_QUOTES, 'UTF-8') ?></div>
+            <div class="fg-dropdown__title"><?= htmlspecialchars($userName, ENT_QUOTES, 'UTF-8') ?></div>
+            <div class="fg-dropdown__sub"><?= htmlspecialchars($statusSub, ENT_QUOTES, 'UTF-8') ?></div>
           </div>
           <div class="fg-dropdown__list">
             <a class="fg-ddlink" role="menuitem" href="userprofile.php">
@@ -311,6 +375,7 @@ $stmt->close();
       <a class="fg-nav__link" href="myrentals.php">My Rentals</a>
       <a class="fg-nav__link" href="about.php">About</a>
       <a class="fg-nav__link" href="contact.php">Contact</a>
+      <a class="fg-nav__link" href="user_messages.php">Messages<span class="fg-msg-badge js-user-msg-badge"<?= $msgUnreadCount > 0 ? '' : ' hidden' ?>><?= $msgUnreadCount > 99 ? '99+' : (int)$msgUnreadCount ?></span></a>
     </div>
   </div>
 </header>
@@ -359,4 +424,35 @@ if (fgProfileBtn && fgProfileMenu) {
     }
   });
 }
+
+function setUserMessagesBadge(count) {
+  const n = Math.max(0, Number(count) || 0);
+  document.querySelectorAll('.js-user-msg-badge').forEach((badge) => {
+    if (n > 0) {
+      badge.textContent = n > 99 ? '99+' : String(n);
+      badge.hidden = false;
+      badge.removeAttribute('hidden');
+    } else {
+      badge.textContent = '0';
+      badge.hidden = true;
+    }
+  });
+}
+window.setUserMessagesBadge = setUserMessagesBadge;
+
+function updateUserMessagesBadge() {
+  fetch('chat_unread.php', { credentials: 'same-origin', cache: 'no-store' })
+    .then((r) => r.json())
+    .then((data) => {
+      if (data && data.ok) setUserMessagesBadge(data.count);
+    })
+    .catch(() => {});
+}
+window.updateUserMessagesBadge = updateUserMessagesBadge;
+updateUserMessagesBadge();
+setInterval(updateUserMessagesBadge, 15000);
 </script>
+<?php if ($userID > 0):
+  $geminiRole = 'user';
+  include __DIR__ . '/gemini_widget.php';
+endif; ?>

@@ -90,7 +90,7 @@ if (!empty($new_end) && $new_end !== $old_end) {
     SELECT id, customer_id, start_date
     FROM rentals
     WHERE vehicle_id=? 
-      AND status IN ('pending','reserved')
+      AND status IN ('waitlist','pending','reserved')
       AND start_date BETWEEN ? AND ?
   ");
   $find->bind_param("iss", $vehicle_id, $old_end, $new_end);

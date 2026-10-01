@@ -9,6 +9,20 @@ session_name('fleetgo_session_user');
 session_start();
 
 require_once __DIR__ . '/includes/db.php';
+require_once __DIR__ . '/includes/payment_methods.php';
+ensure_rental_waitlist_status($conn);
+
+/* Ensure cancel_reason columns exist for user cancellations */
+try {
+  $col = $conn->query("SHOW COLUMNS FROM rentals LIKE 'cancel_reason'");
+  if (!$col || $col->num_rows === 0) {
+    $conn->query("ALTER TABLE rentals ADD COLUMN cancel_reason TEXT NULL DEFAULT NULL AFTER status");
+  }
+  $col2 = $conn->query("SHOW COLUMNS FROM rentals LIKE 'cancelled_at'");
+  if (!$col2 || $col2->num_rows === 0) {
+    $conn->query("ALTER TABLE rentals ADD COLUMN cancelled_at DATETIME NULL DEFAULT NULL AFTER cancel_reason");
+  }
+} catch (Throwable $e) { /* ignore */ }
 
 /* --- Access Control --- */
 if (!isset($_SESSION['user_id'])) {
@@ -40,6 +54,19 @@ define('VEH_IMG_URL', 'assets/vehicles');
 $fuelRates = null;
 $washingRates = null;
 
+// Older database backups may not contain this policy table yet. Ensure it
+// exists before reading the current rates so the rentals page remains usable.
+$conn->query("
+    CREATE TABLE IF NOT EXISTS fuel_charge_rates (
+        id INT(11) NOT NULL AUTO_INCREMENT,
+        vehicle_type VARCHAR(50) NOT NULL,
+        empty_rate DECIMAL(10,2) DEFAULT 2000.00,
+        quarter_rate DECIMAL(10,2) DEFAULT 1500.00,
+        half_rate DECIMAL(10,2) DEFAULT 1000.00,
+        three_quarter_rate DECIMAL(10,2) DEFAULT 500.00,
+        PRIMARY KEY (id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+");
 $stmt = $conn->prepare("SELECT * FROM fuel_charge_rates ORDER BY id DESC LIMIT 1");
 $stmt->execute();
 $fuelRates = $stmt->get_result()->fetch_assoc();
@@ -53,10 +80,37 @@ $stmt->close();
 //     interior_exterior DECIMAL(10,2) DEFAULT 600.00,
 //     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 // );
+// Keep compatibility with database backups created before washing rates existed.
+$conn->query("
+    CREATE TABLE IF NOT EXISTS washing_types (
+        id INT(11) NOT NULL AUTO_INCREMENT,
+        vehicle_type VARCHAR(50) NOT NULL,
+        washing_name VARCHAR(100) NOT NULL,
+        washing_rate DECIMAL(10,2) NOT NULL,
+        PRIMARY KEY (id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+");
 $stmt = $conn->prepare("SELECT * FROM washing_types ORDER BY id DESC LIMIT 1");
 $stmt->execute();
 $washingRates = $stmt->get_result()->fetch_assoc();
 $stmt->close();
+
+// Extension requests (user submits → admin approves)
+$conn->query("
+  CREATE TABLE IF NOT EXISTS rental_extension_requests (
+    id INT(11) NOT NULL AUTO_INCREMENT,
+    rental_id INT(11) NOT NULL,
+    customer_id INT(11) NOT NULL,
+    old_end_date DATE NOT NULL,
+    requested_end_date DATE NOT NULL,
+    status ENUM('PENDING','APPROVED','REJECTED') NOT NULL DEFAULT 'PENDING',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    reviewed_at DATETIME NULL DEFAULT NULL,
+    PRIMARY KEY (id),
+    KEY idx_rental_status (rental_id, status),
+    KEY idx_status (status)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+");
 
 // Function to calculate late fee
 function calculateLateFee($dailyRate, $hoursLate) {
@@ -64,7 +118,7 @@ function calculateLateFee($dailyRate, $hoursLate) {
 }
 
 /* ==========================
-   HANDLE USER EXTEND (POST)
+   HANDLE USER EXTEND (POST) — creates pending request
 ========================== */
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['extend_rental_id'], $_POST['new_end'])) {
   $rid    = (int)$_POST['extend_rental_id'];
@@ -83,7 +137,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['extend_rental_id'], $
   $stmt->close();
 
   if (!$r) {
-    $_SESSION['flash_error'] = "❌ Rental not found.";
+    $_SESSION['flash_error'] = "Rental not found.";
     header("Location: myrentals.php");
     exit;
   }
@@ -95,65 +149,55 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['extend_rental_id'], $
   }
 
   $oldEnd = $r['end_date'];
-  if (!$newEnd || strtotime($newEnd) < strtotime($oldEnd)) {
-    $_SESSION['flash_error'] = "New end date must be the same or later than current end date.";
+  if (!$newEnd || strtotime($newEnd) <= strtotime($oldEnd)) {
+    $_SESSION['flash_error'] = "New end date must be later than the current end date.";
     header("Location: myrentals.php");
     exit;
   }
 
-  // === 1. Update current rental ===
-  $stmt = $conn->prepare("UPDATE rentals SET end_date=? WHERE id=?");
-  $stmt->bind_param("si", $newEnd, $rid);
-  $stmt->execute();
-  $stmt->close();
+  // Block duplicate pending requests
+  $chk = $conn->prepare("SELECT id FROM rental_extension_requests WHERE rental_id = ? AND status = 'PENDING' LIMIT 1");
+  $chk->bind_param('i', $rid);
+  $chk->execute();
+  $existing = $chk->get_result()->fetch_assoc();
+  $chk->close();
+  if ($existing) {
+    $_SESSION['flash_error'] = "An extension request is already pending for this rental.";
+    header("Location: myrentals.php");
+    exit;
+  }
 
-  $vID   = (int)$r['vehicle_id'];
+  $ins = $conn->prepare("
+    INSERT INTO rental_extension_requests
+      (rental_id, customer_id, old_end_date, requested_end_date, status, created_at)
+    VALUES (?, ?, ?, ?, 'PENDING', NOW())
+  ");
+  $ins->bind_param('iiss', $rid, $userID, $oldEnd, $newEnd);
+  if (!$ins->execute()) {
+    $ins->close();
+    $_SESSION['flash_error'] = "Could not submit extension request. Please try again.";
+    header("Location: myrentals.php");
+    exit;
+  }
+  $ins->close();
+
+  $vID = (int)$r['vehicle_id'];
   $model = $r['make_model'] ?? 'Vehicle';
   $modelEsc = $conn->real_escape_string($model);
+  $newEndFmt = date('M d, Y', strtotime($newEnd));
 
-  // === 2. Notify self (user A) ===
-  $msgSelf = "✅ Your booking for <b>$modelEsc</b> was extended until <b>$newEnd</b>.";
   require_once __DIR__ . '/includes/notification_manager.php';
-  createNotificationIfNotExists($conn, $userID, $vID, $msgSelf);
-  $stmt->close();
+  $msgSelf = "Extension request submitted for <b>{$modelEsc}</b> until <b>{$newEndFmt}</b>. Waiting for admin approval.";
+  createNotificationIfNotExists($conn, $userID, $vID, $msgSelf, false);
 
-  // === 3. Find any other upcoming renters (user B, C) and handle overlap ===
-  $check = $conn->prepare("
-    SELECT id, customer_id, status, start_date, end_date
-    FROM rentals
-    WHERE vehicle_id = ?
-      AND id <> ?
-      AND status IN ('reserved','pending')
-      AND start_date <= ?
-  ");
-  $check->bind_param("iis", $vID, $rid, $newEnd);
-  $check->execute();
-  $result = $check->get_result();
-
-  while ($row = $result->fetch_assoc()) {
-    $cid  = (int)$row['customer_id'];
-    $rid2 = (int)$row['id'];
-
-    // cancel conflicting reservation
-    $conn->query("UPDATE rentals SET status='cancelled' WHERE id=$rid2");
-
-    // notify affected user B
-    $msgB = "Your advance booking for <b>$modelEsc</b> was cancelled because the previous renter extended until <b>$newEnd</b>.";
-    createNotificationIfNotExists($conn, $cid, $vID, $msgB);
-  }
-  $check->close();
-
-  // === 4. Keep vehicle as rented ===
-  $conn->query("UPDATE vehicles SET current_status='rented' WHERE id=$vID");
-
-  $_SESSION['flash_success'] = "✅ Extended until ".h($newEnd).".";
+  $_SESSION['flash_success'] = "Extension request submitted until {$newEndFmt}. Waiting for admin approval.";
   header("Location: myrentals.php");
   exit;
 }
 
  /* --- Filters --- */
  $statusFilter = strtolower(trim((string)($_GET['status'] ?? 'all')));
- $allowedStatus = ['all','pending','reserved','ongoing','completed'];
+ $allowedStatus = ['all','waitlist','pending','reserved','ongoing','completed','cancelled'];
  if (!in_array($statusFilter, $allowedStatus, true)) {
    $statusFilter = 'all';
  }
@@ -173,14 +217,14 @@ $sql = "
             ELSE r.status
           END) AS rental_status_detailed
   FROM rentals r
-  JOIN vehicles v ON r.vehicle_id = v.id
+  LEFT JOIN vehicles v ON r.vehicle_id = v.id
   WHERE r.customer_id = ?
 ";
 $params = [$userID];
 $types  = 'i';
 
  if ($statusFilter !== 'all') {
-  $sql .= " AND LOWER(r.status) = LOWER(?)";
+  $sql .= " AND LOWER(CAST(r.status AS CHAR)) = ?";
   $params[] = $statusFilter;
   $types   .= 's';
  }
@@ -198,6 +242,49 @@ $res = $stmt->get_result();
 $rentals = $res->fetch_all(MYSQLI_ASSOC);
 $stmt->close();
 
+// Payment summary per rental (pending + posted downpayments)
+$paymentByRental = [];
+$pendingExtensionsByRental = [];
+if (!empty($rentals)) {
+  $ids = array_map(function($r) { return (int)$r['id']; }, $rentals);
+  $ids = array_values(array_filter($ids, function($id) { return $id > 0; }));
+  if ($ids) {
+    $in = implode(',', $ids);
+    $payRes = $conn->query("
+      SELECT rental_id,
+             COALESCE(SUM(CASE WHEN status IN ('PENDING','POSTED') THEN amount ELSE 0 END), 0) AS paid_or_pending,
+             COALESCE(SUM(CASE WHEN status = 'PENDING' THEN amount ELSE 0 END), 0) AS pending_amount,
+             COALESCE(SUM(CASE WHEN status = 'POSTED' THEN amount ELSE 0 END), 0) AS posted_amount,
+             MAX(CASE WHEN status = 'PENDING' THEN 1 ELSE 0 END) AS has_pending_proof
+      FROM rental_payments
+      WHERE rental_id IN ($in)
+        AND payment_type = 'DOWNPAYMENT'
+      GROUP BY rental_id
+    ");
+    if ($payRes) {
+      while ($row = $payRes->fetch_assoc()) {
+        $paymentByRental[(int)$row['rental_id']] = $row;
+      }
+    }
+
+    $extRes = $conn->query("
+      SELECT id, rental_id, old_end_date, requested_end_date, status, created_at
+      FROM rental_extension_requests
+      WHERE rental_id IN ($in)
+        AND status = 'PENDING'
+      ORDER BY created_at DESC, id DESC
+    ");
+    if ($extRes) {
+      while ($row = $extRes->fetch_assoc()) {
+        $rid = (int)$row['rental_id'];
+        if (!isset($pendingExtensionsByRental[$rid])) {
+          $pendingExtensionsByRental[$rid] = $row;
+        }
+      }
+    }
+  }
+}
+
 // SUBQUERY: User statistics with scalar subqueries for customer dashboard
 $userStats = $conn->query("
     SELECT 
@@ -213,20 +300,21 @@ $userStats = $conn->query("
   $flash_error   = $_SESSION['flash_error'] ?? '';
   unset($_SESSION['flash_success'], $_SESSION['flash_error']);
 
- $statusCounts = ['pending'=>0,'reserved'=>0,'ongoing'=>0,'completed'=>0];
+ $statusCounts = ['waitlist'=>0,'pending'=>0,'reserved'=>0,'ongoing'=>0,'completed'=>0,'cancelled'=>0,'conflict_pending'=>0];
  try {
-   $stmt = $conn->prepare("SELECT LOWER(status) AS st, COUNT(*) AS c FROM rentals WHERE customer_id = ? GROUP BY LOWER(status)");
+   $stmt = $conn->prepare("SELECT LOWER(CAST(status AS CHAR)) AS st, COUNT(*) AS c FROM rentals WHERE customer_id = ? GROUP BY LOWER(CAST(status AS CHAR))");
    $stmt->bind_param('i', $userID);
    $stmt->execute();
    $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
    $stmt->close();
    foreach ($rows as $row) {
-     $st = (string)($row['st'] ?? '');
-     if (isset($statusCounts[$st])) $statusCounts[$st] = (int)($row['c'] ?? 0);
+     $st = strtolower(trim((string)($row['st'] ?? '')));
+     if ($st === '') continue;
+     if (!isset($statusCounts[$st])) $statusCounts[$st] = 0;
+     $statusCounts[$st] = (int)($row['c'] ?? 0);
    }
  } catch (Throwable $e) {
- }
-?>
+ }?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -345,8 +433,9 @@ a{text-decoration:none;color:inherit;}
 .rentals-grid{display:flex;flex-direction:column;gap:14px;margin-top:22px}
 .rental-card{
   display:grid;
-  grid-template-columns: 180px 1fr 260px;
-  gap:18px;
+  grid-template-columns: 180px minmax(0, 1fr) minmax(250px, 290px);
+  align-items:stretch;
+  gap:0;
   background:var(--card);
   border:1px solid var(--border);
   border-radius:var(--radius);
@@ -357,32 +446,94 @@ a{text-decoration:none;color:inherit;}
 }
 .rental-card:hover{transform:translateY(-2px);border-color:var(--border-hover);background:var(--card-hover);box-shadow:var(--shadow-lg)}
 .rental-card.is-ongoing{outline:2px solid rgba(16,185,129,.25);box-shadow:0 0 0 6px rgba(16,185,129,.06), var(--shadow-lg)}
-.rental-media{position:relative;min-height:130px;background:#07090c}
+.rental-media{position:relative;min-height:150px;background:#07090c}
 .rental-media img{width:100%;height:100%;object-fit:cover;display:block}
-.rental-body{padding:16px 0 16px 0;display:flex;flex-direction:column;gap:10px}
-.rental-top{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding-right:16px}
-.rental-name{font-size:1.15rem;font-weight:900;line-height:1.2}
-.rental-meta{color:var(--text-secondary);font-weight:700;font-size:.9rem}
-.rental-dates{display:flex;flex-wrap:wrap;gap:14px;color:var(--text-secondary);font-weight:700;font-size:.92rem;padding-right:16px}
-.date-chip{display:inline-flex;align-items:center;gap:8px}
-.date-ico{width:18px;height:18px;opacity:.85}
-.status-badge{
-  display:inline-flex;align-items:center;gap:8px;
-  padding:8px 12px;border-radius:999px;
-  font-weight:900;font-size:.8rem;
-  text-transform:uppercase;letter-spacing:.6px;
-  border:1px solid transparent;
+.rental-body{
+  padding:18px 16px;
+  display:flex;flex-direction:column;gap:12px;
+  min-width:0;
 }
+.rental-top{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
+.rental-top > div:first-child{min-width:0;flex:1}
+.rental-name{font-size:1.15rem;font-weight:900;line-height:1.25;word-break:break-word}
+.rental-meta{color:var(--text-secondary);font-weight:700;font-size:.9rem;margin-top:4px;line-height:1.35}
+.rental-dates{display:flex;flex-wrap:wrap;gap:10px 16px;color:var(--text-secondary);font-weight:700;font-size:.9rem}
+.date-chip{display:inline-flex;align-items:center;gap:8px;line-height:1.3}
+.date-ico{width:18px;height:18px;opacity:.85;flex-shrink:0}
+.status-badge{
+  display:inline-flex;align-items:center;justify-content:center;gap:6px;
+  padding:7px 12px;border-radius:999px;
+  font-weight:900;font-size:.72rem;
+  text-transform:uppercase;letter-spacing:.55px;
+  border:1px solid transparent;
+  white-space:nowrap;flex-shrink:0;
+  line-height:1.2;
+}
+.status-badge.waitlist{background:rgba(148,163,184,.16);border-color:rgba(148,163,184,.34);color:#e2e8f0}
 .status-badge.pending{background:rgba(245,158,11,.14);border-color:rgba(245,158,11,.28);color:#ffd084}
 .status-badge.reserved{background:rgba(99,102,241,.16);border-color:rgba(99,102,241,.30);color:#c7d2fe}
 .status-badge.ongoing{background:rgba(16,185,129,.16);border-color:rgba(16,185,129,.30);color:#a7f3d0}
 .status-badge.completed{background:rgba(148,163,184,.12);border-color:rgba(148,163,184,.20);color:#e2e8f0}
+.status-badge.cancelled{background:rgba(239,68,68,.15);border-color:rgba(239,68,68,.28);color:#fecaca}
+.status-badge.extension-pending{background:rgba(245,158,11,.16);border-color:rgba(245,158,11,.32);color:#ffd084}
+.extension-note{
+  margin:0;padding:10px 12px;border-radius:10px;
+  font-weight:800;font-size:.82rem;color:#ffd084;line-height:1.4;
+  background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.22);
+}
+.extension-note.is-cancel{
+  color:#fecaca;background:rgba(239,68,68,.08);border-color:rgba(239,68,68,.28);
+}
+.hold-reminder{
+  margin:0 0 16px;padding:14px 16px;border-radius:12px;
+  background:rgba(255,209,102,.12);border:1px solid rgba(255,209,102,.4);
+  color:#ffe7a3;font-weight:700;line-height:1.45;
+}
+.hold-reminder strong{display:block;margin-bottom:4px;color:#fff;}
 
-.rental-side{padding:16px;display:flex;flex-direction:column;gap:12px;border-left:1px solid var(--border);background:rgba(255,255,255,.02)}
-.price{font-size:1.25rem;font-weight:900}
-.price-sub{color:var(--text-secondary);font-weight:700;font-size:.85rem}
-.ends{color:var(--text-secondary);font-weight:700;font-size:.86rem}
-.card-actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:auto}
+.rental-side{
+  padding:18px 16px;
+  display:flex;flex-direction:column;gap:16px;justify-content:space-between;
+  border-left:1px solid var(--border);background:rgba(255,255,255,.02);
+  min-width:0;
+}
+.price-block{
+  display:flex;flex-direction:column;align-items:flex-end;gap:8px;
+  text-align:right;min-width:0;
+}
+.price{font-size:1.25rem;font-weight:900;line-height:1.2}
+.price-sub{color:var(--text-secondary);font-weight:700;font-size:.85rem;line-height:1.4}
+.price-sub b{color:var(--text-primary);font-weight:900}
+.promo-row,
+.pay-due-row{
+  display:flex;flex-wrap:wrap;align-items:center;justify-content:flex-end;
+  gap:8px;width:100%;
+}
+.price-was{
+  color:var(--text-secondary);font-weight:800;font-size:.85rem;
+  text-decoration:line-through;line-height:1.3;
+}
+.pay-due-row .price-sub{width:100%;text-align:right}
+.ends{color:var(--text-secondary);font-weight:700;font-size:.86rem;line-height:1.35;margin:0}
+.card-actions{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:8px;
+  width:100%;
+  margin-top:0;
+}
+.card-actions .btn{
+  width:100%;
+  min-height:42px;
+  padding:10px 12px;
+  box-sizing:border-box;
+  white-space:nowrap;
+}
+.card-actions .btn-span,
+.card-actions .btn-pay-now,
+.card-actions .btn:only-child{
+  grid-column:1 / -1;
+}
 .btn{
   display:inline-flex;align-items:center;justify-content:center;gap:8px;
   padding:10px 12px;border-radius:12px;
@@ -392,25 +543,112 @@ a{text-decoration:none;color:inherit;}
   color:var(--text-primary);
   cursor:pointer;
   transition:all .2s ease;
+  line-height:1.2;
 }
 .btn:hover{border-color:var(--border-hover);background:rgba(255,255,255,.06);transform:translateY(-1px)}
 .btn.primary{background:var(--gradient);border-color:transparent;color:#041b22}
 .btn.danger{background:linear-gradient(135deg, rgba(239,68,68,.18), rgba(239,68,68,.10));border-color:rgba(239,68,68,.30);color:#fecaca}
 .btn[disabled]{opacity:.55;cursor:not-allowed;transform:none}
 
+.promo-badge{
+  display:inline-flex;align-items:center;
+  background:var(--gradient);
+  color:#041b22;padding:4px 9px;border-radius:8px;
+  font-size:.68rem;font-weight:800;text-transform:uppercase;
+  letter-spacing:.4px;line-height:1.2;white-space:nowrap;
+}
+
+.pay-modal{
+  text-align:left;
+  max-width:520px;
+  max-height:min(90vh, 860px);
+  overflow-y:auto;
+  overscroll-behavior:contain;
+  -webkit-overflow-scrolling:touch;
+}
+.pay-modal .form-row{margin-bottom:14px}
+.pay-modal label{display:block;font-weight:800;font-size:.82rem;color:var(--text-secondary);margin-bottom:6px;text-transform:uppercase;letter-spacing:.4px}
+.pay-modal input[type=text],
+.pay-modal input[type=number],
+.pay-modal select,
+.pay-modal textarea{
+  width:100%;padding:12px;border-radius:12px;border:1px solid var(--border);
+  background:rgba(255,255,255,.03);color:var(--text-primary);font-weight:700;
+}
+.pay-modal select option,
+.pay-modal select optgroup{
+  color:#111;
+  background:#fff;
+}
+.pay-modal input:focus,
+.pay-modal select:focus,
+.pay-modal textarea:focus{outline:none;border-color:var(--brand);box-shadow:0 0 0 3px rgba(93,208,255,.12)}
+.pay-upload{
+  border:2px dashed rgba(255,255,255,.14);border-radius:14px;padding:18px;text-align:center;
+  background:rgba(255,255,255,.02);cursor:pointer;transition:all .2s ease;
+}
+.pay-upload:hover{border-color:rgba(93,208,255,.35);background:rgba(93,208,255,.05)}
+.pay-upload input{display:none}
+.pay-upload-title{font-weight:900;margin-top:8px}
+.pay-upload-sub{color:var(--text-secondary);font-size:.85rem;font-weight:700;margin-top:4px}
+.pay-upload-preview{margin-top:12px;display:none}
+.pay-upload-preview img{max-width:100%;max-height:120px;object-fit:contain;border-radius:12px;border:1px solid var(--border)}
+.pay-summary{
+  display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;
+  padding:12px 14px;border-radius:12px;border:1px solid var(--border);background:rgba(93,208,255,.06);
+  margin-bottom:14px;font-weight:800;
+}
+.pay-msg{margin-top:10px;font-weight:800;text-align:center}
+.pay-method-info{
+  margin-top:10px;padding:18px 16px;border-radius:14px;
+  border:1px solid rgba(93,208,255,.25);background:rgba(93,208,255,.05);
+  display:flex;flex-direction:column;align-items:center;gap:14px;text-align:center;
+}
+.pay-method-info[hidden]{display:none}
+.pay-method-qr-wrap{display:flex;flex-direction:column;align-items:center;gap:10px}
+.pay-method-qr{
+  display:block;width:min(240px, 70vw);height:auto;aspect-ratio:1 / 1;
+  padding:10px;border-radius:14px;background:#fff;object-fit:contain;cursor:zoom-in;
+}
+.pay-qr-download{
+  display:inline-flex;align-items:center;gap:6px;
+  padding:8px 14px;border-radius:10px;text-decoration:none;
+  font-size:.82rem;font-weight:800;color:#041b22;
+  background:linear-gradient(135deg,var(--brand),var(--brand2, #7cffc7));
+}
+.pay-qr-download:hover{filter:brightness(1.05)}
+.pay-method-details{width:100%;display:grid;gap:8px;justify-items:center}
+.pay-method-number{justify-content:center}
+.pay-method-provider{font-weight:900;font-size:1rem}
+.pay-method-label{font-size:.72rem;font-weight:800;text-transform:uppercase;letter-spacing:.4px;color:var(--text-secondary)}
+.pay-method-number{
+  display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+  font-family:ui-monospace,Consolas,monospace;font-size:1.05rem;font-weight:800;word-break:break-all;
+}
+.pay-copy-btn{
+  border:1px solid var(--border);background:rgba(255,255,255,.05);color:var(--text-primary);
+  border-radius:8px;padding:4px 10px;font-size:.75rem;font-weight:800;cursor:pointer;font-family:inherit;
+}
+.pay-copy-btn:hover{border-color:rgba(93,208,255,.4)}
+.pay-method-name{color:var(--text-secondary);font-size:.85rem;font-weight:700}
+.pay-method-hint{color:var(--text-secondary);font-size:.78rem;font-weight:700}
+
 @media (max-width: 980px){
-  .rental-card{grid-template-columns: 160px 1fr;}
+  .rental-card{grid-template-columns: 160px minmax(0, 1fr);}
   .rental-side{grid-column:1 / -1;border-left:none;border-top:1px solid var(--border)}
-  .rental-body{padding:16px}
-  .rental-top,.rental-dates{padding-right:0}
+  .price-block{align-items:flex-start;text-align:left}
+  .promo-row,.pay-due-row{justify-content:flex-start}
+  .pay-due-row .price-sub{text-align:left}
 }
 @media (max-width: 560px){
   .page-head{flex-direction:column;align-items:flex-start}
   .mini-kpis{justify-content:flex-start}
   .rental-card{grid-template-columns: 1fr;}
   .rental-media{min-height:200px}
-  .card-actions{flex-direction:column}
-  .btn{width:100%}
+  .card-actions{grid-template-columns:1fr}
+  .card-actions .btn-span,
+  .card-actions .btn-pay-now,
+  .card-actions .btn:only-child{grid-column:auto}
 }
 .filter-bar{
   display:flex;flex-wrap:wrap;gap:16px;align-items:center;justify-content:center;
@@ -496,23 +734,17 @@ a{text-decoration:none;color:inherit;}
 .original-cost{
   font-size:.85rem;color:var(--text-secondary);text-decoration:line-through;
 }
-.promo-badge{
-  background:var(--gradient);
-  color:#041b22;padding:2px 8px;border-radius:var(--radius-sm);
-  font-size:.7rem;font-weight:800;text-transform:uppercase;
-  letter-spacing:.5px;
-}
-.status-badge{
+.rental-item .status-badge{
   padding:6px 12px;border-radius:var(--radius);font-weight:700;font-size:.8rem;
   text-transform:uppercase;letter-spacing:.5px;text-align:center;
 }
-.status-badge.active{
+.rental-item .status-badge.active{
   background:rgba(16,185,129,.15);color:var(--success);
 }
-.status-badge.completed{
+.rental-item .status-badge.completed{
   background:rgba(93,208,255,.15);color:var(--brand);
 }
-.status-badge.cancelled{
+.rental-item .status-badge.cancelled{
   background:rgba(239,68,68,.15);color:var(--error);
 }
 .rental-actions{
@@ -530,16 +762,19 @@ a{text-decoration:none;color:inherit;}
 /* ===== ENHANCED MODAL ===== */
 .modal-bg{
   position:fixed;inset:0;background:rgba(0,0,0,.7);
-  display:none;align-items:center;justify-content:center;z-index:999;
+  display:none;align-items:center;justify-content:center;z-index:10050;
   backdrop-filter:blur(8px);
+  overflow-y:auto;
+  padding:24px 12px;
 }
-.modal-bg.show{display:flex;animation:fadeIn 0.3s ease;}
+.modal-bg.show{display:flex !important;animation:fadeIn 0.3s ease;}
 .modal{
   background:var(--card);
   color:var(--text-primary);border-radius:var(--radius);padding:32px;
   width:90%;max-width:480px;box-shadow:var(--shadow-xl);
   text-align:center;position:relative;animation:slideUp 0.3s ease;
   border:2px solid var(--border);
+  margin:auto;
 }
 @keyframes slideUp{
   from{transform:translateY(30px);opacity:0}
@@ -1038,6 +1273,12 @@ a{text-decoration:none;color:inherit;}
 <div class="main">
   <?php if($flash_success): ?><div class="toast"><?= h($flash_success) ?></div><?php endif; ?>
   <?php if($flash_error): ?><div class="toast err"><?= h($flash_error) ?></div><?php endif; ?>
+  <?php if((int)($statusCounts['waitlist'] ?? 0) > 0): ?>
+    <div class="hold-reminder" role="status">
+      <strong>Your booking is on hold</strong>
+      You still have not paid. Submit your downpayment receipt to move the booking to pending. Until then it stays on hold and will not be approved.
+    </div>
+  <?php endif; ?>
 
   <!-- ===== ENHANCED FILTERS ===== -->
   <div class="filter-section">
@@ -1047,7 +1288,7 @@ a{text-decoration:none;color:inherit;}
         <div class="page-sub">Manage your bookings and track your trips</div>
       </div>
       <div class="mini-kpis" aria-label="Rental summary">
-        <div class="mini-kpi"><span>Total</span><?= (int)($userStats['total_rentals'] ?? count($rentals)) ?></div>
+        <div class="mini-kpi"><span>Total</span><?= (int)array_sum($statusCounts) ?></div>
         <div class="mini-kpi"><span>Active</span><?= (int)($userStats['active_rentals'] ?? ($statusCounts['ongoing'] ?? 0)) ?></div>
         <div class="mini-kpi"><span>Completed</span><?= (int)($userStats['completed_rentals'] ?? ($statusCounts['completed'] ?? 0)) ?></div>
       </div>
@@ -1056,7 +1297,11 @@ a{text-decoration:none;color:inherit;}
     <div class="tabs" role="tablist" aria-label="Rental status tabs">
       <a class="tab <?= $statusFilter==='all'?'active':'' ?>" href="myrentals.php?status=all<?= $q!=='' ? '&q='.urlencode($q) : '' ?>" role="tab" aria-selected="<?= $statusFilter==='all'?'true':'false' ?>">
         All
-        <span class="tab-count"><?= (int)($userStats['total_rentals'] ?? (array_sum($statusCounts) ?: count($rentals))) ?></span>
+        <span class="tab-count"><?= (int)array_sum($statusCounts) ?></span>
+      </a>
+      <a class="tab <?= $statusFilter==='waitlist'?'active':'' ?>" href="myrentals.php?status=waitlist<?= $q!=='' ? '&q='.urlencode($q) : '' ?>" role="tab" aria-selected="<?= $statusFilter==='waitlist'?'true':'false' ?>">
+        Waitlist
+        <span class="tab-count"><?= (int)($statusCounts['waitlist'] ?? 0) ?></span>
       </a>
       <a class="tab <?= $statusFilter==='pending'?'active':'' ?>" href="myrentals.php?status=pending<?= $q!=='' ? '&q='.urlencode($q) : '' ?>" role="tab" aria-selected="<?= $statusFilter==='pending'?'true':'false' ?>">
         Pending
@@ -1073,6 +1318,10 @@ a{text-decoration:none;color:inherit;}
       <a class="tab <?= $statusFilter==='completed'?'active':'' ?>" href="myrentals.php?status=completed<?= $q!=='' ? '&q='.urlencode($q) : '' ?>" role="tab" aria-selected="<?= $statusFilter==='completed'?'true':'false' ?>">
         Completed
         <span class="tab-count"><?= (int)($statusCounts['completed'] ?? 0) ?></span>
+      </a>
+      <a class="tab <?= $statusFilter==='cancelled'?'active':'' ?>" href="myrentals.php?status=cancelled<?= $q!=='' ? '&q='.urlencode($q) : '' ?>" role="tab" aria-selected="<?= $statusFilter==='cancelled'?'true':'false' ?>">
+        Cancelled
+        <span class="tab-count"><?= (int)($statusCounts['cancelled'] ?? 0) ?></span>
       </a>
     </div>
 
@@ -1100,16 +1349,28 @@ a{text-decoration:none;color:inherit;}
           <path d="M3 9h18v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9z"/>
         </svg>
       </div>
-      <h3>No Rentals Yet</h3>
-      <p>You haven't made any bookings yet. Start your journey by exploring our amazing fleet!</p>
-      <a href="vehiclepage.php">Browse Vehicles</a>
+      <?php if ($statusFilter === 'cancelled'): ?>
+        <h3>No Cancelled Bookings</h3>
+        <p>Cancelled rentals will show up here once you cancel a pending or reserved booking.</p>
+      <?php elseif ($statusFilter !== 'all'): ?>
+        <h3>No <?= h(ucfirst($statusFilter)) ?> Rentals</h3>
+        <p>Nothing matches this filter right now.</p>
+        <a href="myrentals.php?status=all">View all rentals</a>
+      <?php else: ?>
+        <h3>No Rentals Yet</h3>
+        <p>You haven't made any bookings yet. Start your journey by exploring our amazing fleet!</p>
+        <a href="vehiclepage.php">Browse Vehicles</a>
+      <?php endif; ?>
     </div>
   <?php else: ?>
     <div class="rentals-grid">
       <?php foreach($rentals as $r):
         $status = strtolower((string)($r['status'] ?? ''));
-        $photo  = $r['photo'] ? (VEH_IMG_URL.'/'.$r['photo']) : 'assets/vehicles/sedan.jpg';
+        $photo  = $r['photo'] ? (VEH_IMG_URL.'/'.$r['photo']) : (VEH_IMG_URL.'/01.jpg');
         $days = max(1, round((strtotime($r['end_date']) - strtotime($r['start_date'])) / 86400, 1));
+        if (empty($r['make_model'])) $r['make_model'] = 'Vehicle';
+        if (empty($r['plate_no'])) $r['plate_no'] = '—';
+        if (empty($r['vehicle_type'])) $r['vehicle_type'] = '—';
 
         $baseRentalCost = $days * (float)$r['daily_rate'];
         $originalCost = $baseRentalCost;
@@ -1129,13 +1390,28 @@ a{text-decoration:none;color:inherit;}
         $statusLabel = ucfirst($status);
         if ($status === 'ongoing') $statusLabel = 'Ongoing';
         if ($status === 'reserved') $statusLabel = 'Reserved';
+        if ($status === 'waitlist') $statusLabel = 'Waitlist';
         if ($status === 'pending') $statusLabel = 'Pending';
         if ($status === 'completed') $statusLabel = 'Completed';
+        if ($status === 'cancelled') $statusLabel = 'Cancelled';
 
-        $statusClass = in_array($status, ['pending','reserved','ongoing','completed'], true) ? $status : 'completed';
+        $statusClass = in_array($status, ['waitlist','pending','reserved','ongoing','completed','cancelled'], true) ? $status : 'completed';
         $isOngoing = ($status === 'ongoing');
+        $cancelReason = trim((string)($r['cancel_reason'] ?? ''));
+        $canCancel = in_array($status, ['waitlist', 'pending', 'reserved'], true);
+
+        $downpaymentDue = isset($r['downpayment']) && (float)$r['downpayment'] > 0
+          ? (float)$r['downpayment']
+          : round($totalCost * 0.5, 2);
+        $payInfo = $paymentByRental[(int)$r['id']] ?? null;
+        $paidOrPending = (float)($payInfo['paid_or_pending'] ?? 0);
+        $hasPendingProof = !empty($payInfo['has_pending_proof']);
+        $remainingDownpayment = max(0, round($downpaymentDue - $paidOrPending, 2));
+        $canPayNow = in_array($status, ['waitlist', 'pending', 'reserved'], true) && $remainingDownpayment > 0 && !$hasPendingProof;
+        $pendingExt = $pendingExtensionsByRental[(int)$r['id']] ?? null;
+        $hasPendingExtension = !empty($pendingExt);
       ?>
-      <div class="rental-card <?= $isOngoing ? 'is-ongoing' : '' ?>" data-rental-id="<?= (int)$r['id'] ?>" data-status="<?= h($status) ?>" data-total="<?= number_format($totalCost,2,'.','') ?>" onclick="if(event.target.closest('button,a')) return; openRentalDetails(<?= (int)$r['id'] ?>);">
+      <div class="rental-card <?= $isOngoing ? 'is-ongoing' : '' ?>" data-rental-id="<?= (int)$r['id'] ?>" data-status="<?= h($status) ?>" data-total="<?= number_format($totalCost,2,'.','') ?>" data-downpayment="<?= number_format($downpaymentDue,2,'.','') ?>" data-remaining="<?= number_format($remainingDownpayment,2,'.','') ?>" onclick="if(event.target.closest('button,a')) return; openRentalDetails(<?= (int)$r['id'] ?>);">
         <div class="rental-media">
           <img src="<?= h($photo) ?>" alt="Vehicle">
         </div>
@@ -1146,8 +1422,8 @@ a{text-decoration:none;color:inherit;}
               <div class="rental-name"><?= h($r['make_model']) ?></div>
               <div class="rental-meta"><?= h($r['plate_no']) ?> • <?= h($r['vehicle_type']) ?></div>
             </div>
-            <div class="status-badge <?= h($statusClass) ?>">
-              <?= h($statusLabel) ?>
+            <div class="status-badge <?= $hasPendingExtension ? 'extension-pending' : h($statusClass) ?>">
+              <?= $hasPendingExtension ? 'Extension Pending' : h($statusLabel) ?>
             </div>
           </div>
 
@@ -1161,34 +1437,75 @@ a{text-decoration:none;color:inherit;}
               End: <?= date('M d, Y', $endTs) ?>
             </div>
           </div>
+          <?php if($hasPendingExtension): ?>
+            <div class="extension-note">
+              Requested extension until <?= date('M d, Y', strtotime((string)$pendingExt['requested_end_date'])) ?> — waiting for admin approval
+            </div>
+          <?php endif; ?>
+          <?php if($status === 'waitlist'): ?>
+            <div class="extension-note">On hold until you pay. Submit your receipt to move this booking to pending.</div>
+          <?php endif; ?>
+          <?php if($status === 'cancelled' && $cancelReason !== ''): ?>
+            <div class="extension-note is-cancel">
+              Cancelled<?= !empty($r['cancelled_at']) ? ' on '.date('M d, Y', strtotime((string)$r['cancelled_at'])) : '' ?>:
+              <?= h($cancelReason) ?>
+            </div>
+          <?php endif; ?>
         </div>
 
         <div class="rental-side">
-          <div>
+          <div class="price-block">
             <div class="price">₱<?= number_format($totalCost,2) ?></div>
             <div class="price-sub">₱<?= number_format((float)$r['daily_rate'],2) ?>/day • <?= (int)$days ?> day<?= (int)$days===1?'':'s' ?></div>
             <?php if($hasPromo): ?>
-              <div class="price-sub" style="margin-top:6px">
+              <div class="promo-row">
                 <span class="promo-badge"><?= h($r['promo_applied']) ?></span>
-                <span style="margin-left:8px;color:var(--text-secondary);font-weight:800;text-decoration:line-through;">₱<?= number_format($originalCost,2) ?></span>
+                <span class="price-was">₱<?= number_format($originalCost,2) ?></span>
+              </div>
+            <?php endif; ?>
+            <?php if(in_array($status, ['waitlist','pending','reserved'], true)): ?>
+              <div class="pay-due-row">
+                <div class="price-sub">Downpayment due: <b>₱<?= number_format($remainingDownpayment > 0 ? $remainingDownpayment : 0, 2) ?></b></div>
+                <?php if($hasPendingProof): ?>
+                  <span class="promo-badge">Receipt Under Review</span>
+                <?php elseif($remainingDownpayment <= 0): ?>
+                  <span class="promo-badge">Downpayment Submitted</span>
+                <?php endif; ?>
               </div>
             <?php endif; ?>
             <?php if($status === 'ongoing' && $endsInDays !== null): ?>
-              <div class="ends" style="margin-top:10px">Ends in <?= (int)$endsInDays ?> day<?= (int)$endsInDays===1?'':'s' ?></div>
+              <div class="ends">Ends in <?= (int)$endsInDays ?> day<?= (int)$endsInDays===1?'':'s' ?></div>
             <?php elseif($status === 'completed'): ?>
-              <div class="ends" style="margin-top:10px">Completed on <?= date('M d, Y', $endTs) ?></div>
+              <div class="ends">Completed on <?= date('M d, Y', $endTs) ?></div>
             <?php endif; ?>
           </div>
 
           <div class="card-actions">
             <button class="btn primary" type="button" onclick="openRentalDetails(<?= (int)$r['id'] ?>)">View Details</button>
-            <?php if($status === 'pending'): ?>
-              <button class="btn danger" type="button" disabled>Cancel</button>
+            <?php if($canCancel): ?>
+              <button class="btn danger" type="button"
+                data-rental-id="<?= (int)$r['id'] ?>"
+                data-vehicle-name="<?= h($r['make_model']) ?>"
+                onclick="event.preventDefault(); event.stopPropagation(); openCancelModal(this); return false;">
+                Cancel
+              </button>
             <?php endif; ?>
-            <?php if($status === 'pending' || $status === 'reserved'): ?>
-              <button class="btn" type="button" disabled>Pay Now</button>
+            <?php if($canPayNow): ?>
+              <button class="btn primary btn-pay-now btn-span" type="button"
+                data-rental-id="<?= (int)$r['id'] ?>"
+                data-vehicle-name="<?= h($r['make_model']) ?>"
+                data-amount="<?= number_format($remainingDownpayment, 2, '.', '') ?>"
+                onclick="event.preventDefault(); event.stopPropagation(); openPayModal(this); return false;">
+                Pay Now
+              </button>
+            <?php elseif(in_array($status, ['waitlist','pending','reserved'], true) && $hasPendingProof): ?>
+              <button class="btn btn-span" type="button" disabled>Receipt Submitted</button>
+            <?php elseif(in_array($status, ['waitlist','pending','reserved'], true) && $remainingDownpayment <= 0): ?>
+              <button class="btn btn-span" type="button" disabled>Paid</button>
             <?php endif; ?>
-            <?php if($status === 'ongoing'): ?>
+            <?php if($status === 'ongoing' && $hasPendingExtension): ?>
+              <button class="btn btn-span" type="button" disabled>Extension Pending</button>
+            <?php elseif($status === 'ongoing'): ?>
               <button class="btn" type="button" onclick="openExtendModal(<?= (int)$r['id'] ?>, '<?= h($r['end_date']) ?>')">Extend</button>
             <?php endif; ?>
             <?php if($status === 'completed'): ?>
@@ -1424,16 +1741,127 @@ a{text-decoration:none;color:inherit;}
 <!-- ===== EXTEND MODAL ===== -->
 <div class="modal-bg" id="extendModal">
   <div class="modal">
-    <h2>Extend Rental</h2>
+    <h2>Request Extension</h2>
     <p>Current end date: <b id="oldEndUser"></b></p>
     <form method="post" id="extendForm">
       <input type="hidden" name="extend_rental_id" id="extendRentalId">
       <label for="new_end">Select new return date:</label>
       <input type="date" name="new_end" id="new_end" required>
       <div class="actions">
-        <button class="btn btn-extend" type="submit">Confirm Extension</button>
+        <button class="btn btn-extend" type="submit">Submit Request</button>
         <button class="btn btn-cancel" type="button" onclick="closeExtendModal()">Cancel</button>
       </div>
+    </form>
+  </div>
+</div>
+
+<!-- ===== PAY NOW MODAL ===== -->
+<div class="modal-bg" id="payModal">
+  <div class="modal pay-modal">
+    <h2>Pay Downpayment</h2>
+    <p style="margin-top:-6px">Submit payment for <b id="payVehicleName"></b></p>
+    <div class="pay-summary">
+      <div>Amount due: <span id="payAmountDue">₱0.00</span></div>
+      <div style="color:var(--text-secondary);font-size:.9rem">Upload a clear photo of your receipt</div>
+    </div>
+    <form id="payForm" enctype="multipart/form-data">
+      <input type="hidden" name="rental_id" id="payRentalId">
+      <div class="form-row">
+        <label for="payAmount">Payment Amount</label>
+        <input type="number" name="amount" id="payAmount" min="1" step="0.01" required>
+      </div>
+      <div class="form-row">
+        <label for="payMethod">Payment Method</label>
+        <?php $customerPaymentMethods = pm_list($conn, true); ?>
+        <?php if ($customerPaymentMethods): ?>
+          <select name="payment_method_id" id="payMethod" required>
+            <option value="">Select method</option>
+            <?php foreach (['ewallet' => 'E-wallets', 'bank' => 'Banks'] as $pmType => $pmGroup): ?>
+              <?php $pmGroupItems = array_filter($customerPaymentMethods, fn($m) => $m['provider_type'] === $pmType); ?>
+              <?php if ($pmGroupItems): ?>
+                <optgroup label="<?= htmlspecialchars($pmGroup) ?>">
+                  <?php foreach ($pmGroupItems as $pm): ?>
+                    <option value="<?= (int)$pm['id'] ?>"><?= htmlspecialchars($pm['provider_name']) ?></option>
+                  <?php endforeach; ?>
+                </optgroup>
+              <?php endif; ?>
+            <?php endforeach; ?>
+          </select>
+        <?php else: ?>
+          <select name="payment_method_id" id="payMethod" required disabled>
+            <option value="">No payment methods available yet</option>
+          </select>
+          <div class="pay-method-hint" style="margin-top:8px">FleetGo hasn't set up any bank or e-wallet accounts yet. Please check back later or message support.</div>
+        <?php endif; ?>
+        <div class="pay-method-info" id="payMethodInfo" hidden>
+          <div class="pay-method-qr-wrap" id="payMethodQrWrap">
+            <a id="payMethodQrLink" target="_blank" rel="noopener"><img class="pay-method-qr" id="payMethodQr" alt="Payment QR code"></a>
+            <a class="pay-qr-download" id="payMethodQrDownload" download>&#8595; Download QR</a>
+          </div>
+          <div class="pay-method-details">
+            <div class="pay-method-provider" id="payMethodProvider"></div>
+            <div>
+              <div class="pay-method-label">Account Number</div>
+              <div class="pay-method-number">
+                <span id="payMethodNumber"></span>
+                <button type="button" class="pay-copy-btn" id="payMethodCopy">Copy</button>
+              </div>
+            </div>
+            <div class="pay-method-name" id="payMethodName"></div>
+            <div class="pay-method-hint" id="payMethodHint">Scan the QR or send to the account number, then upload your receipt below.</div>
+          </div>
+        </div>
+      </div>
+      <div class="form-row">
+        <label for="payReference">Reference No. (optional)</label>
+        <input type="text" name="reference_no" id="payReference" placeholder="e.g. GCash ref / OR number">
+      </div>
+      <div class="form-row">
+        <label>Receipt Photo</label>
+        <label class="pay-upload" for="payReceiptPhoto">
+          <input type="file" name="receipt_photo" id="payReceiptPhoto" accept="image/*" required>
+          <div style="font-size:1.4rem">⬆</div>
+          <div class="pay-upload-title">Attach Receipt Photo</div>
+          <div class="pay-upload-sub">JPG, PNG, WEBP, or GIF • Max 5MB</div>
+          <div class="pay-upload-preview" id="payReceiptPreview" hidden>
+            <img id="payReceiptImg" alt="Receipt preview" style="display:none">
+            <div class="pay-upload-sub" id="payReceiptName"></div>
+          </div>
+        </label>
+      </div>
+      <div class="form-row">
+        <label for="payNotes">Notes (optional)</label>
+        <textarea name="notes" id="payNotes" rows="2" placeholder="Any note for the admin"></textarea>
+      </div>
+      <div class="actions">
+        <button class="btn primary" type="submit" id="paySubmitBtn">Submit Payment</button>
+        <button class="btn" type="button" onclick="closePayModal()">Cancel</button>
+      </div>
+      <div class="pay-msg" id="payMsg"></div>
+    </form>
+  </div>
+</div>
+
+<!-- ===== CANCEL BOOKING MODAL ===== -->
+<div class="modal-bg" id="cancelModal">
+  <div class="modal pay-modal">
+    <h2>Cancel Booking</h2>
+    <p style="margin-top:-6px">Cancel rental for <b id="cancelVehicleName">this vehicle</b></p>
+    <form id="cancelForm">
+      <input type="hidden" name="rental_id" id="cancelRentalId" value="">
+      <div class="form-row">
+        <label for="cancelReason">Reason for cancellation <span style="color:var(--error)">*</span></label>
+        <textarea name="cancel_reason" id="cancelReason" rows="4" maxlength="500" required
+          placeholder="Tell us why you need to cancel (min. 5 characters)"></textarea>
+        <div style="margin-top:6px;font-size:.8rem;color:var(--text-secondary);font-weight:700">
+          <span id="cancelReasonCount">0</span>/500
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn danger" type="submit" id="cancelSubmitBtn">Confirm Cancel</button>
+        <button class="btn" type="button" onclick="closeCancelModal()">Keep Booking</button>
+      </div>
+      <div class="pay-msg" id="cancelMsg"></div>
     </form>
   </div>
 </div>
@@ -1692,9 +2120,10 @@ document.addEventListener('DOMContentLoaded', function() {
   });
   
   // Receipt modal event listeners
-  if (receiptModal) {
-    receiptModal.addEventListener('click', e => {
-      if (e.target === receiptModal) closeReceiptModal();
+  const receiptModalEl = document.getElementById('receiptModal');
+  if (receiptModalEl) {
+    receiptModalEl.addEventListener('click', e => {
+      if (e.target === receiptModalEl) closeReceiptModal();
     });
   }
   
@@ -2254,6 +2683,303 @@ function openRentalDetails(rentalId){
   m.style.display = 'flex';
   document.body.style.overflow = 'hidden';
 }
+
+function openPayModal(btnOrId, vehicleName, amountDue){
+  const modal = document.getElementById('payModal');
+  const form = document.getElementById('payForm');
+  if(!modal || !form){
+    alert('Payment form could not be opened. Please refresh the page.');
+    return;
+  }
+
+  let rentalId = btnOrId;
+  let name = vehicleName;
+  let amount = amountDue;
+  if (btnOrId && typeof btnOrId === 'object' && btnOrId.nodeType === 1) {
+    rentalId = btnOrId.getAttribute('data-rental-id');
+    name = btnOrId.getAttribute('data-vehicle-name');
+    amount = btnOrId.getAttribute('data-amount');
+  }
+
+  document.getElementById('payRentalId').value = String(rentalId || '');
+  document.getElementById('payVehicleName').textContent = name || 'this vehicle';
+  document.getElementById('payAmountDue').textContent = '₱' + Number(amount || 0).toLocaleString('en-US', {minimumFractionDigits: 2});
+  document.getElementById('payAmount').value = Number(amount || 0).toFixed(2);
+  document.getElementById('payAmount').max = Number(amount || 0).toFixed(2);
+  document.getElementById('payMethod').value = '';
+  renderPayMethodInfo('');
+  document.getElementById('payReference').value = '';
+  document.getElementById('payNotes').value = '';
+  document.getElementById('payReceiptPhoto').value = '';
+  document.getElementById('payMsg').textContent = '';
+  const preview = document.getElementById('payReceiptPreview');
+  const img = document.getElementById('payReceiptImg');
+  preview.hidden = true;
+  preview.style.display = 'none';
+  img.removeAttribute('src');
+  img.style.display = 'none';
+  document.getElementById('payReceiptName').textContent = '';
+  document.getElementById('paySubmitBtn').disabled = Object.keys(PAY_METHODS).length === 0;
+
+  if (modal.parentElement !== document.body) {
+    document.body.appendChild(modal);
+  }
+  modal.classList.add('show');
+  modal.style.display = 'flex';
+  document.body.style.overflow = 'hidden';
+}
+
+function closePayModal(){
+  const modal = document.getElementById('payModal');
+  if(!modal) return;
+  modal.classList.remove('show');
+  modal.style.display = 'none';
+  document.body.style.overflow = 'auto';
+}
+
+function openCancelModal(btn){
+  const modal = document.getElementById('cancelModal');
+  const form = document.getElementById('cancelForm');
+  if(!modal || !form){
+    alert('Cancel form could not be opened. Please refresh the page.');
+    return;
+  }
+  const rentalId = btn.getAttribute('data-rental-id') || '';
+  const name = btn.getAttribute('data-vehicle-name') || 'this vehicle';
+  document.getElementById('cancelRentalId').value = String(rentalId);
+  document.getElementById('cancelVehicleName').textContent = name;
+  document.getElementById('cancelReason').value = '';
+  document.getElementById('cancelReasonCount').textContent = '0';
+  document.getElementById('cancelMsg').textContent = '';
+  document.getElementById('cancelSubmitBtn').disabled = false;
+
+  if (modal.parentElement !== document.body) {
+    document.body.appendChild(modal);
+  }
+  modal.classList.add('show');
+  modal.style.display = 'flex';
+  document.body.style.overflow = 'hidden';
+  setTimeout(() => document.getElementById('cancelReason')?.focus(), 50);
+}
+
+function closeCancelModal(){
+  const modal = document.getElementById('cancelModal');
+  if(!modal) return;
+  modal.classList.remove('show');
+  modal.style.display = 'none';
+  document.body.style.overflow = 'auto';
+}
+
+const cancelReasonEl = document.getElementById('cancelReason');
+if (cancelReasonEl) {
+  cancelReasonEl.addEventListener('input', function(){
+    const n = (this.value || '').length;
+    const c = document.getElementById('cancelReasonCount');
+    if (c) c.textContent = String(n);
+  });
+}
+
+const cancelForm = document.getElementById('cancelForm');
+if (cancelForm) {
+  cancelForm.addEventListener('submit', async function(e){
+    e.preventDefault();
+    const msg = document.getElementById('cancelMsg');
+    const btn = document.getElementById('cancelSubmitBtn');
+    const reason = (document.getElementById('cancelReason')?.value || '').trim();
+    const rentalId = document.getElementById('cancelRentalId')?.value || '';
+
+    if (!rentalId) {
+      if (msg) msg.textContent = 'Invalid rental.';
+      return;
+    }
+    if (reason.length < 5) {
+      if (msg) msg.textContent = 'Please enter a reason (at least 5 characters).';
+      document.getElementById('cancelReason')?.focus();
+      return;
+    }
+
+    if (!confirm('Cancel this booking? This cannot be undone.')) return;
+
+    btn.disabled = true;
+    if (msg) msg.textContent = 'Cancelling…';
+
+    try {
+      const fd = new FormData(cancelForm);
+      const res = await fetch('includes/ajax_cancel_rental.php', { method: 'POST', body: fd });
+      const data = await res.json();
+      if (data && data.success) {
+        if (msg) msg.textContent = data.message || 'Cancelled.';
+        showToast(data.message || 'Booking cancelled.', true);
+        setTimeout(() => { window.location.href = 'myrentals.php?status=cancelled'; }, 800);
+      } else {
+        if (msg) msg.textContent = (data && data.message) ? data.message : 'Cancellation failed.';
+        showToast((data && data.message) || 'Cancellation failed.', false);
+        btn.disabled = false;
+      }
+    } catch (err) {
+      if (msg) msg.textContent = 'Network error. Please try again.';
+      showToast('Network error. Please try again.', false);
+      btn.disabled = false;
+    }
+  });
+}
+
+window.openCancelModal = openCancelModal;
+window.closeCancelModal = closeCancelModal;
+
+document.addEventListener('click', function(e){
+  const btn = e.target.closest('.btn-pay-now');
+  if(!btn) return;
+  e.preventDefault();
+  e.stopPropagation();
+  openPayModal(btn);
+}, true);
+
+const PAY_METHODS = <?= json_encode(array_column(array_map(fn($m) => [
+  'id' => (int)$m['id'],
+  'provider' => $m['provider_name'],
+  'type' => $m['provider_type'],
+  'account_number' => $m['account_number'],
+  'account_name' => (string)($m['account_name'] ?? ''),
+  'qr' => (string)($m['qr_image'] ?? ''),
+], $customerPaymentMethods ?? []), null, 'id'), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?>;
+
+function renderPayMethodInfo(id){
+  const box = document.getElementById('payMethodInfo');
+  if (!box) return;
+  const m = PAY_METHODS[String(id)] || PAY_METHODS[Number(id)];
+  if (!m) { box.hidden = true; return; }
+
+  const qr = document.getElementById('payMethodQr');
+  const qrLink = document.getElementById('payMethodQrLink');
+  const qrWrap = document.getElementById('payMethodQrWrap');
+  const qrDownload = document.getElementById('payMethodQrDownload');
+  if (m.qr) {
+    qr.src = m.qr;
+    qrLink.href = m.qr;
+    const ext = (m.qr.split('.').pop() || 'png').split('?')[0];
+    qrDownload.href = m.qr;
+    qrDownload.setAttribute('download', m.provider.replace(/[^a-z0-9]+/gi, '_') + '_QR.' + ext);
+    qrWrap.style.display = '';
+  } else {
+    qr.removeAttribute('src');
+    qrLink.removeAttribute('href');
+    qrDownload.removeAttribute('href');
+    qrWrap.style.display = 'none';
+  }
+  document.getElementById('payMethodProvider').textContent = m.provider;
+  document.getElementById('payMethodNumber').textContent = m.account_number;
+  const nameEl = document.getElementById('payMethodName');
+  nameEl.textContent = m.account_name ? ('Account name: ' + m.account_name) : '';
+  nameEl.style.display = m.account_name ? '' : 'none';
+  document.getElementById('payMethodHint').textContent = m.qr
+    ? 'Scan the QR or send to the account number, then upload your receipt below.'
+    : 'Send to the account number above, then upload your receipt below.';
+  const copyBtn = document.getElementById('payMethodCopy');
+  if (copyBtn) copyBtn.textContent = 'Copy';
+  box.hidden = false;
+}
+
+document.getElementById('payMethod')?.addEventListener('change', function(){
+  renderPayMethodInfo(this.value);
+});
+
+document.getElementById('payMethodCopy')?.addEventListener('click', async function(){
+  const num = document.getElementById('payMethodNumber')?.textContent || '';
+  if (!num) return;
+  try {
+    await navigator.clipboard.writeText(num);
+    this.textContent = 'Copied';
+  } catch (e) {
+    this.textContent = 'Copy failed';
+  }
+  setTimeout(() => { this.textContent = 'Copy'; }, 1500);
+});
+
+const payReceiptPhoto = document.getElementById('payReceiptPhoto');
+if (payReceiptPhoto) {
+  payReceiptPhoto.addEventListener('change', function(){
+    const file = this.files && this.files[0];
+    const preview = document.getElementById('payReceiptPreview');
+    const img = document.getElementById('payReceiptImg');
+    const name = document.getElementById('payReceiptName');
+    if(!file){
+      preview.hidden = true;
+      preview.style.display = 'none';
+      img.removeAttribute('src');
+      img.style.display = 'none';
+      return;
+    }
+    name.textContent = file.name;
+    const reader = new FileReader();
+    reader.onload = function(ev){
+      img.src = ev.target.result;
+      img.style.display = 'block';
+      preview.hidden = false;
+      preview.style.display = 'block';
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+const payForm = document.getElementById('payForm');
+if (payForm) {
+  payForm.addEventListener('submit', async function(e){
+    e.preventDefault();
+    const msg = document.getElementById('payMsg');
+    const btn = document.getElementById('paySubmitBtn');
+    const fileInput = document.getElementById('payReceiptPhoto');
+
+    if(!fileInput.files || !fileInput.files.length){
+      msg.style.color = '#fecaca';
+      msg.textContent = 'Please upload a receipt photo.';
+      return;
+    }
+
+    btn.disabled = true;
+    msg.style.color = 'var(--text-secondary)';
+    msg.textContent = 'Submitting payment...';
+
+    try {
+      const endpoint = <?= json_encode(rtrim(str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'] ?? '')), '/') . '/includes/ajax_user_payment.php') ?>;
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        credentials: 'same-origin',
+        body: new FormData(this)
+      });
+      if (!res.ok) {
+        throw new Error('HTTP ' + res.status);
+      }
+      const data = await res.json();
+      if(!data.success){
+        msg.style.color = '#fecaca';
+        msg.textContent = data.message || 'Payment submission failed.';
+        btn.disabled = false;
+        return;
+      }
+      msg.style.color = '#a7f3d0';
+      msg.textContent = data.message || 'Payment submitted.';
+      setTimeout(() => window.location.reload(), 1200);
+    } catch (err) {
+      msg.style.color = '#fecaca';
+      msg.textContent = 'Network error. Please try again.';
+      btn.disabled = false;
+    }
+  });
+}
+
+const payModalEl = document.getElementById('payModal');
+if (payModalEl) {
+  if (payModalEl.parentElement !== document.body) {
+    document.body.appendChild(payModalEl);
+  }
+  payModalEl.addEventListener('click', function(e){
+    if(e.target === this) closePayModal();
+  });
+}
+
+window.openPayModal = openPayModal;
+window.closePayModal = closePayModal;
 
 window.openRentalDetails = openRentalDetails;
 window.closeDetailsModal = closeDetailsModal;

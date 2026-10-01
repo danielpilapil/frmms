@@ -135,8 +135,21 @@ if(isset($_POST['action'])){
           throw new Exception("Registration failed. Please try again.");
         }
         
-        $uid=$conn->insert_id;
+        $uid=(int)$conn->insert_id;
         $stmt->close();
+
+        // Guard against broken users.id (missing AUTO_INCREMENT / PRIMARY KEY)
+        if ($uid <= 0) {
+          $lookup=$conn->prepare("SELECT id FROM users WHERE email=? ORDER BY created_at DESC LIMIT 1");
+          $lookup->bind_param("s",$email);
+          $lookup->execute();
+          $found=$lookup->get_result()->fetch_assoc();
+          $lookup->close();
+          $uid=(int)($found['id'] ?? 0);
+          if ($uid <= 0) {
+            throw new Exception("Registration failed: user id was not assigned. Please contact support.");
+          }
+        }
         
         // Log registration
         $details="New user '$full' registered with verification flow.";
@@ -892,7 +905,11 @@ document.addEventListener('DOMContentLoaded', () => {
   
   // Validation function
   function validateField(field, rules) {
-    const value = field.value.trim();
+    // The contact field is displayed as "09XX XXX XXXX". Validate its digits
+    // so the display spacing does not make an otherwise valid number fail.
+    const value = field.name === 'contact_no'
+      ? field.value.replace(/\D/g, '')
+      : field.value.trim();
     let errorMessage = '';
     
     // Remove existing error
